@@ -1,0 +1,141 @@
+# HG Camera Counter Configuration Template
+# 
+# IMPORTANT: Copy this to data/config/config.yaml and fill in your values
+# Or set environment variables: SUPABASE_URL, SUPABASE_ANON_KEY, BRANCH_CODE
+
+project_name: "HG Camera Counter"
+version: "0.1.0"
+branch_code: "${BRANCH_CODE:DEMO}"  # Or set BRANCH_CODE env var
+
+# Supabase Configuration
+supabase:
+  url: "${SUPABASE_URL:}"           # Or set SUPABASE_URL env var
+  key: "${SUPABASE_ANON_KEY:}"      # Or set SUPABASE_ANON_KEY env var
+
+# Camera Configuration
+# Format:
+#   CameraName:
+#     rtsp_url: "rtsp://user:pass@host:port/path"
+#     enabled: true|false
+#     zones_file: "relative/path/to/zones_CameraName.json"
+#     note: "optional description"
+
+cameras:
+  Camera_01:
+    rtsp_url: "rtsp://admin:112113114@192.168.1.24:554/ch01/0"
+    enabled: true
+    zones_file: "data/zones/zones_Camera_01.json"
+    note: "Main shop view"
+  
+  Camera_02:
+    rtsp_url: "rtsp://admin:112113114@192.168.1.83:554/ch01/0"
+    enabled: true
+    zones_file: "data/zones/zones_Camera_02.json"
+    note: "Wash area"
+  
+  # Camera_03:
+  #   rtsp_url: "rtsp://..."
+  #   enabled: false
+  #   zones_file: "data/zones/zones_Camera_03.json"
+  #   note: "Backup camera"
+
+# YOLO Detection Configuration
+yolo:
+  model: "yolov8m.pt"    # yolov8n.pt (smaller), yolov8m.pt (medium), yolov8l.pt (large)
+  conf: 0.35             # Confidence threshold (0.0-1.0)
+  iou: 0.5               # IOU threshold for NMS
+  imgsz: 640             # Input image size
+  device: "auto"         # auto, cpu, mps, cuda
+
+# Runtime Service Configuration
+runtime:
+  target_fps: 10              # Target frames per second per camera
+  max_workers: 4              # Max number of camera threads
+  queue_size: 100             # Internal frame queue size
+  heartbeat_interval: 30      # Seconds between heartbeat updates
+  reconnect_interval: 5       # Seconds to wait before reconnecting to failed RTSP
+
+# Zone Dwell Time Thresholds (seconds)
+# Used to determine when person transitions from one event to another
+dwell_time:
+  chair: 120    # Count as haircut after 120 sec in CHAIR zone
+  wash: 60      # Count as wash after 60 sec in WASH zone
+  wait: 30      # Count as waiting after 30 sec in WAIT zone
+
+# Staff Detection Configuration
+staff:
+  enable_reid: false          # Enable re-identification (requires more GPU/CPU)
+  dwell_threshold: 12         # Seconds in staff zone to tag as staff
+  gallery_dir: "data/staff_gallery"  # Staff photos directory
+
+# Paths (relative to project root)
+# All paths support both relative and absolute paths
+paths:
+  models: "models"                           # YOLO model files
+  zones: "data/zones"                        # Zone JSON files
+  staff_gallery: "data/staff_gallery"        # Staff gallery photos
+  staff_db: "data/staff_gallery/staff_db.json"  # Generated staff database
+  reports: "reports"                         # CSV reports output
+  snapshots: "snapshots"                     # Frame captures
+  logs: "logs"                               # Application logs
+
+# Logging Configuration
+logging:
+  level: "INFO"           # DEBUG, INFO, WARN, ERROR
+  max_file_size: 10485760 # 10 MB
+  backup_count: 5         # Number of backup log files to keep
+  format: "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s"
+
+# Reporting Configuration
+reporting:
+  enabled: true
+  daily_summary: true             # Generate daily CSV report
+  event_snapshot_on_count: true   # Save snapshot when event counted
+  csv_fields:
+    - timestamp
+    - camera
+    - event_type
+    - person_id
+    - zone
+    - dwell_seconds
+
+# Advanced Options
+
+# Zone Point Mode
+# foot  = Use bottom center of bbox (person's foot)
+# center = Use center of bbox
+zone_point_mode: "foot"
+
+# Multi-camera Matching
+global_match:
+  max_seconds: 2.0    # Max time gap to match same person across cameras
+  max_distance: 0.12  # Max normalized distance for matching
+
+# Track Merging
+track_merge:
+  max_seconds: 3.0    # Merge tracks within this time
+  max_distance: 0.10  # Merge tracks within this normalized distance
+
+# Cooldown
+recount_cooldown_sec: 300  # Don't recount same person in same zone for N seconds
+
+# Supabase Submission
+supabase_submit:
+  enabled: true
+  retry_attempts: 3
+  retry_delay_sec: 5
+  batch_size: 50  # Events to batch before submitting
+  batch_timeout_sec: 60
+
+# Optional: Integrations (Phase 2)
+# integrations:
+#   grafana:
+#     enabled: false
+#     url: "http://localhost:3000"
+#     org_id: 1
+#   slack:
+#     enabled: false
+#     webhook_url: "https://hooks.slack.com/..."
+#   email:
+#     enabled: false
+#     smtp_server: "smtp.gmail.com"

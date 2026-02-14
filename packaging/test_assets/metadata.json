@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1-test",
+  "notes": "Test release",
+  "assets": [
+    {
+      "name": "HGCameraCounter-test.zip",
+      "url": "file:///C:/Users/Huagr/Downloads/project_count%20%281%29/project_count/packaging/test_assets/HGCameraCounter-test.zip",
+      "sha256": "dd6519633b3b7b3e3df5b8514f6c9f58bef1242e6948fd8d6491ff82d0c3bc12"
+    }
+  ]
+}
