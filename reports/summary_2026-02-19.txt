@@ -1,0 +1,22 @@
+Daily Report: 2026-02-19
+==================================================
+
+Total Events: 4
+Unique People: 4
+
+Event Breakdown:
+  entrance: 0
+  haircut: 3
+  wash: 1
+  wait: 0
+  exit: 0
+
+By Camera:
+  Camera_02: 4
+
+Average Dwell Time (seconds):
+  entrance: 0.0s
+  haircut: 154.9s
+  wash: 109.3s
+  wait: 0.0s
+  exit: 0.0s

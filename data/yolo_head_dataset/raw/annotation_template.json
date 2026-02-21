@@ -1,0 +1,14 @@
+{
+  "images": [
+    {
+      "file_name": "images/train/example_001.jpg",
+      "width": 1920,
+      "height": 1080,
+      "annotations": [
+        {"class": "person", "bbox_xyxy": [520, 210, 880, 980]},
+        {"class": "head_customer", "bbox_xyxy": [610, 190, 760, 360]},
+        {"class": "staff_uniform", "bbox_xyxy": [980, 220, 1240, 900]}
+      ]
+    }
+  ]
+}

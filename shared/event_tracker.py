@@ -20,7 +20,7 @@ import json
 class EventType(Enum):
     """Event types"""
     ENTRANCE = "entrance"
-    CHAIR = "chair"
+    CHAIR = "haircut"
     WASH = "wash"
     WAIT = "wait"
     EXIT = "exit"

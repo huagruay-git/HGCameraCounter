@@ -130,6 +130,10 @@ class RTSPWatchdog:
                 return False
             
             info = self.health_info[camera_name]
+
+            # Never reconnect healthy cameras.
+            if info.status == CameraHealth.HEALTHY and info.consecutive_failures <= 0:
+                return False
             
             # Don't retry if exceeded max attempts
             if info.consecutive_failures > self.max_retries:

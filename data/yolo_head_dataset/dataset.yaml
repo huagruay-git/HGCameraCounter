@@ -1,0 +1,11 @@
+# YOLO dataset for salon classes
+# Update absolute/relative path if needed before training.
+path: data/yolo_head_dataset
+train: images/train
+val: images/val
+
+# class order must match labels and runtime config
+names:
+  0: person
+  1: head_customer
+  2: staff_uniform

@@ -5,6 +5,7 @@ Handle device status, events, and heartbeat
 """
 
 import time
+import re
 import logging
 import threading
 from datetime import datetime
@@ -44,6 +45,7 @@ class SupabaseClient:
         
         self.client = None
         self.is_connected = False
+        self.known_missing_columns = set()
         
         self._connect()
     
@@ -120,7 +122,7 @@ class SupabaseClient:
         except Exception as e:
             self.logger.error(f"Error updating device status: {e}")
             return False
-    
+
     def submit_events(
         self,
         events: List[Dict[str, Any]],
@@ -146,6 +148,12 @@ class SupabaseClient:
         for event in payload:
             event["branch_code"] = self.branch_code
         
+        # Filter out known missing columns immediately
+        if self.known_missing_columns:
+            for event in payload:
+                for col in self.known_missing_columns:
+                    event.pop(col, None)
+
         # Try to submit with retries
         for attempt in range(retry_attempts):
             try:
@@ -154,20 +162,32 @@ class SupabaseClient:
                 return True
             except Exception as e:
                 msg = str(e)
+                # Auto-adapt to schema differences by removing missing columns
+                # reported by PostgREST (e.g. "Could not find the 'camera' column ...").
+                m = re.search(r"Could not find the '([^']+)' column", msg)
+                if m:
+                    missing_col = m.group(1)
+                    self.known_missing_columns.add(missing_col)
+                    
+                    # Remove from current payload for retry
+                    for event in payload:
+                        event.pop(missing_col, None)
+                        
+                    self.logger.warning(
+                        f"Supabase table '{self.events_table}' missing column '{missing_col}', retrying without it"
+                    )
+                    continue
+                
+                # Check for other specific error patterns if needed
                 if "branch_code" in msg and ("schema cache" in msg or "Could not find" in msg):
-                    try:
-                        payload_no_branch = []
-                        for event in payload:
-                            x = dict(event)
-                            x.pop("branch_code", None)
-                            payload_no_branch.append(x)
-                        self.client.table(self.events_table).insert(payload_no_branch).execute()
-                        self.logger.info(
-                            f"Submitted {len(events)} events to Supabase (without branch_code column)"
-                        )
-                        return True
-                    except Exception:
-                        pass
+                     self.known_missing_columns.add("branch_code")
+                     for event in payload:
+                        event.pop("branch_code", None)
+                     self.logger.warning(
+                        f"Supabase table '{self.events_table}' likely missing 'branch_code', retrying without it"
+                     )
+                     continue
+
                 self.logger.warning(
                     f"Error submitting events (attempt {attempt + 1}/{retry_attempts}): {e}"
                 )
@@ -206,6 +226,8 @@ class SupabaseSync:
         heartbeat_interval: int = 30,
         batch_size: int = 50,
         batch_timeout: int = 60,
+        retry_attempts: int = 3,
+        retry_delay: float = 2.0,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -216,12 +238,16 @@ class SupabaseSync:
             heartbeat_interval: Heartbeat interval (seconds)
             batch_size: Events to batch before submitting
             batch_timeout: Max time to wait for batch (seconds)
+            retry_attempts: Number of retry attempts in submit_events
+            retry_delay: Delay between retries
             logger: Logger instance
         """
         self.client = supabase_client
         self.heartbeat_interval = heartbeat_interval
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout
+        self.retry_attempts = retry_attempts
+        self.retry_delay = retry_delay
         self.logger = logger or logging.getLogger(__name__)
         
         self.event_queue: List[Dict] = []
@@ -298,7 +324,11 @@ class SupabaseSync:
             events_to_submit = self.event_queue.copy()
             self.event_queue.clear()
         
-        if self.client.submit_events(events_to_submit):
+        if self.client.submit_events(
+            events_to_submit,
+            retry_attempts=self.retry_attempts,
+            retry_delay=self.retry_delay
+        ):
             self.last_batch_flush = datetime.now()
     
     def _send_heartbeat(self):

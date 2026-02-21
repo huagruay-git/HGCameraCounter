@@ -22,11 +22,12 @@ import socket
 import threading
 import logging
 import tempfile
+import gc
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Set
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import numpy as np
 import cv2
@@ -57,9 +58,11 @@ from shared.health_checker import HealthChecker
 # =========================
 CONFIG = Config("data/config/config.yaml")
 logger = setup_logger("runtime", CONFIG.get("paths", {}).get("logs", "logs"))
+RUNTIME_BUILD = "2026-02-16-stallfix-b3"
 
 logger.info(f"Project: {CONFIG.get('project_name')}")
 logger.info(f"Branch: {CONFIG.get('branch_code')}")
+logger.info(f"Runtime build: {RUNTIME_BUILD}")
 
 # =========================
 # CONFIG
@@ -72,7 +75,6 @@ DWELL_TIME_CONFIG = CONFIG.get("dwell_time", {})
 SUPABASE_CONFIG = CONFIG.get("supabase", {})
 
 YOLO_MODEL_PATH = os.path.join(PATHS_CONFIG.get("models", "models"), YOLO_CONFIG.get("model", "yolov8m.pt"))
-TARGET_FPS = RUNTIME_CONFIG.get("target_fps", 10)
 HEARTBEAT_INTERVAL = RUNTIME_CONFIG.get("heartbeat_interval", 30)
 
 SNAPSHOT_DIR = PATHS_CONFIG.get("snapshots", "snapshots")
@@ -413,6 +415,12 @@ class ZoneSessionCounter:
         self._ensure_day()
         now = time.time()
         events = []
+        
+        # Deduplication window: If a haircut was counted in this zone < 15 mins ago, don't count another.
+        # This prevents double counting when tracker ID changes but it's likely the same customer.
+        DEDUPE_WINDOW_SEC = 900.0  # 15 minutes
+        if not hasattr(self, "zone_last_event_ts"):
+            self.zone_last_event_ts = {}
 
         best_by_zone: Dict[str, dict] = {}
         for d in customers:
@@ -458,9 +466,19 @@ class ZoneSessionCounter:
                     st["counted"] = True
                     continue
 
+                # Check if this zone already had an event recently (debounce)
+                last_ts = self.zone_last_event_ts.get(zone, 0.0)
+                if (now - last_ts) < DEDUPE_WINDOW_SEC:
+                    # Valid event already counted recently.
+                    # Just mark this PID as counted so we don't try again for this session.
+                    st["counted"] = True
+                    self.counted_active_pid.add(pid)
+                    continue
+
                 st["counted"] = True
                 self.counted_active_pid.add(pid)
                 self.last_count_by_zone_pid[(zone, pid)] = now
+                self.zone_last_event_ts[zone] = now  # Update debounce timestamp
                 self.total_count += 1
                 self.zone_total[zone] = self.zone_total.get(zone, 0) + 1
                 self.seq += 1
@@ -506,7 +524,14 @@ class ZoneSessionCounter:
 class CameraStream:
     """Capture from RTSP camera"""
     
-    def __init__(self, camera_name: str, rtsp_url: str):
+    def __init__(
+        self,
+        camera_name: str,
+        rtsp_url: str,
+        freeze_max_same_frames: int = 120,
+        freeze_diff_threshold: float = 1.2,
+        connect_policy: Optional[Dict[str, bool]] = None,
+    ):
         self.camera_name = camera_name
         self.rtsp_url = rtsp_url
         self.cap: Optional[cv2.VideoCapture] = None
@@ -514,6 +539,14 @@ class CameraStream:
         self.frame: Optional[np.ndarray] = None
         self.fps = 0
         self.lock = threading.Lock()
+        self.cap_lock = threading.RLock()
+        self.freeze_max_same_frames = int(max(10, freeze_max_same_frames))
+        self.freeze_diff_threshold = float(max(0.0, freeze_diff_threshold))
+        self._last_small_gray: Optional[np.ndarray] = None
+        self._same_frame_count = 0
+        self.reconnect_requested = False
+        self._connect_round = 0
+        self.connect_policy = dict(connect_policy or {})
         
         self.connect()
     
@@ -524,6 +557,15 @@ class CameraStream:
             return
         
         try:
+            with self.cap_lock:
+                if self.cap is not None:
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
+                self.is_connected = False
+
             # Fast network pre-check to avoid long VideoCapture hangs when camera is unreachable.
             parsed = urlparse(self.rtsp_url)
             host = parsed.hostname
@@ -540,31 +582,84 @@ class CameraStream:
                     return
 
             attempts = []
-            # Keep legacy/default open path first (previously working behavior).
-            attempts.append(("default", self.rtsp_url, None))
+            # Backend priority is runtime-tunable because some environments are
+            # more stable on default/udp than ffmpeg_tcp (and vice versa).
+            prefer_tcp = bool(self.connect_policy.get("prefer_tcp", RUNTIME_CONFIG.get("rtsp_prefer_tcp", False)))
+            prefer_ffmpeg_only = bool(self.connect_policy.get("force_ffmpeg", RUNTIME_CONFIG.get("rtsp_force_ffmpeg", False)))
+            allow_udp_fallback = bool(self.connect_policy.get("allow_udp_fallback", RUNTIME_CONFIG.get("rtsp_allow_udp_fallback", False)))
+            rotate_backends = bool(self.connect_policy.get("rotate_backends", RUNTIME_CONFIG.get("rtsp_rotate_backends", False)))
 
-            # FFMPEG backend attempts as fallback.
-            tcp_url = self.rtsp_url
-            if "rtsp_transport=tcp" not in self.rtsp_url:
-                sep = "&" if "?" in self.rtsp_url else "?"
-                tcp_url = f"{self.rtsp_url}{sep}rtsp_transport=tcp"
-            attempts.append(("ffmpeg", self.rtsp_url, cv2.CAP_FFMPEG))
-            attempts.append(("ffmpeg_tcp", tcp_url, cv2.CAP_FFMPEG))
+            def _append_rtsp_params(url: str, kv: Dict[str, str]) -> str:
+                try:
+                    p = urlparse(url)
+                    q = dict(parse_qsl(p.query, keep_blank_values=True))
+                    changed = False
+                    for k, v in kv.items():
+                        if k not in q:
+                            q[k] = v
+                            changed = True
+                    if not changed:
+                        return url
+                    return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), p.fragment))
+                except Exception:
+                    return url
+
+            ffmpeg_common = {
+                # 3s IO timeout (microseconds) to avoid indefinite read() blocks.
+                "stimeout": "3000000",
+                "rw_timeout": "3000000",
+            }
+            tcp_url = _append_rtsp_params(self.rtsp_url, {"rtsp_transport": "tcp", **ffmpeg_common})
+            ffmpeg_url = _append_rtsp_params(self.rtsp_url, ffmpeg_common)
+
+            if prefer_ffmpeg_only:
+                # In low-spec environments, UDP fallback often "connects" but then
+                # stalls. Keep TCP strict by default unless explicitly enabled.
+                if prefer_tcp:
+                    attempts.append(("ffmpeg_tcp", tcp_url, cv2.CAP_FFMPEG))
+                    if allow_udp_fallback:
+                        attempts.append(("ffmpeg", ffmpeg_url, cv2.CAP_FFMPEG))
+                else:
+                    attempts.append(("ffmpeg", ffmpeg_url, cv2.CAP_FFMPEG))
+                    attempts.append(("ffmpeg_tcp", tcp_url, cv2.CAP_FFMPEG))
+            elif prefer_tcp:
+                attempts.append(("ffmpeg_tcp", tcp_url, cv2.CAP_FFMPEG))
+                if allow_udp_fallback:
+                    attempts.append(("ffmpeg", ffmpeg_url, cv2.CAP_FFMPEG))
+                attempts.append(("default", self.rtsp_url, None))
+            else:
+                # Default first tends to be more resilient on some low-spec macOS systems.
+                attempts.append(("default", self.rtsp_url, None))
+                attempts.append(("ffmpeg", ffmpeg_url, cv2.CAP_FFMPEG))
+                attempts.append(("ffmpeg_tcp", tcp_url, cv2.CAP_FFMPEG))
+
+            logger.info(
+                f"{self.camera_name}: connect attempts={[x[0] for x in attempts]} "
+                f"(prefer_tcp={prefer_tcp}, force_ffmpeg={prefer_ffmpeg_only}, "
+                f"udp_fallback={allow_udp_fallback}, rotate={rotate_backends})"
+            )
+
+            # Rotate first-choice backend only when explicitly enabled.
+            if rotate_backends and len(attempts) > 1:
+                offset = self._connect_round % len(attempts)
+                attempts = attempts[offset:] + attempts[:offset]
+            self._connect_round += 1
 
             last_error = ""
             for backend_name, url, backend in attempts:
                 cap = cv2.VideoCapture(url) if backend is None else cv2.VideoCapture(url, backend)
                 if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
                 if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
-                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)
                 if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
                 if cap.isOpened():
-                    self.cap = cap
-                    self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
-                    self.is_connected = True
+                    with self.cap_lock:
+                        self.cap = cap
+                        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
+                        self.is_connected = True
                     logger.info(f"Connected to {self.camera_name} at {self.fps:.1f} FPS via {backend_name}")
                     return
 
@@ -577,24 +672,54 @@ class CameraStream:
     
     def read_frame(self) -> Optional[np.ndarray]:
         """Read next frame"""
-        if not self.is_connected or self.cap is None:
-            return None
-        
         try:
-            ret, frame = self.cap.read()
+            with self.cap_lock:
+                if not self.is_connected or self.cap is None:
+                    return None
+                cap = self.cap
+            ret, frame = cap.read()
             
             if not ret:
                 logger.warning(f"Cannot read frame from {self.camera_name}")
-                self.is_connected = False
+                with self.cap_lock:
+                    self.is_connected = False
+                    self.reconnect_requested = True
                 return None
             
             with self.lock:
                 self.frame = frame
+
+            # Detect frozen RTSP stream (identical/almost-identical frames for too long).
+            try:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                small = cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA)
+                if self._last_small_gray is not None:
+                    diff = cv2.absdiff(small, self._last_small_gray)
+                    mean_diff = float(np.mean(diff))
+                    if mean_diff <= self.freeze_diff_threshold:
+                        self._same_frame_count += 1
+                    else:
+                        self._same_frame_count = 0
+                self._last_small_gray = small
+                if self._same_frame_count >= self.freeze_max_same_frames:
+                    logger.warning(
+                        f"{self.camera_name}: stream appears frozen "
+                        f"(same frame x{self._same_frame_count}), forcing reconnect"
+                    )
+                    with self.cap_lock:
+                        self.is_connected = False
+                        self.reconnect_requested = True
+                    return None
+            except Exception:
+                # Freeze detection must never break normal frame processing.
+                pass
             
             return frame
         except Exception as e:
             logger.error(f"Error reading frame from {self.camera_name}: {e}")
-            self.is_connected = False
+            with self.cap_lock:
+                self.is_connected = False
+                self.reconnect_requested = True
             return None
     
     def test_connection(self) -> bool:
@@ -610,25 +735,38 @@ class CameraStream:
             self.connect()
             
             # Try to read a frame to verify
-            if self.cap and self.cap.isOpened():
-                ret, _ = self.cap.read()
+            with self.cap_lock:
+                cap = self.cap
+            if cap and cap.isOpened():
+                with self.cap_lock:
+                    ret, _ = cap.read()
                 if ret:
-                    self.is_connected = True
+                    with self.cap_lock:
+                        self.is_connected = True
                     logger.info(f"Successfully reconnected to {self.camera_name}")
                     return True
             
-            self.is_connected = False
+            with self.cap_lock:
+                self.is_connected = False
+                self.reconnect_requested = True
             return False
         except Exception as e:
             logger.error(f"Error testing connection for {self.camera_name}: {e}")
-            self.is_connected = False
+            with self.cap_lock:
+                self.is_connected = False
+                self.reconnect_requested = True
             return False
     
     def disconnect(self):
         """Disconnect from camera"""
-        if self.cap is not None:
-            self.cap.release()
-        self.is_connected = False
+        with self.cap_lock:
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            self.is_connected = False
+            self.reconnect_requested = False
+            self._last_small_gray = None
+            self._same_frame_count = 0
         logger.info(f"Disconnected from {self.camera_name}")
 
 
@@ -714,7 +852,7 @@ class RuntimeService:
     """Main runtime service with reliability features"""
     
     def __init__(self):
-        self.yolo_model = self._load_yolo()
+        self.yolo_model, self.yolo_device = self._load_yolo()
         self.yolo_lock = threading.Lock()
         self.cameras: Dict[str, CameraStream] = {}
         self.tracker = MultiCameraTracker()
@@ -758,10 +896,19 @@ class RuntimeService:
         self.customers_lock = threading.Lock()
         self.latest_customers: Dict[str, List[Dict]] = {}
         self.latest_frames: Dict[str, np.ndarray] = {}
+        self._last_frame_ok_ts: Dict[str, float] = {}
         self._fallback_track_lock = threading.Lock()
         self._fallback_tracks: Dict[str, Dict[int, Dict[str, float]]] = {}
         self._next_fallback_tid = 1
         self._last_noid_log_ts: Dict[str, float] = {}
+        self._last_forced_recover_ts: Dict[str, float] = {}
+        self._camera_generation: Dict[str, int] = {}
+        self._camera_lock = threading.Lock()
+        self._restart_backoff_sec: Dict[str, float] = {}
+        self._restart_backoff_until: Dict[str, float] = {}
+        self._stall_restart_count: Dict[str, int] = {}
+        self._camera_connect_policy: Dict[str, Dict[str, bool]] = {}
+        self._camera_good_frame_count: Dict[str, int] = {}
 
         runtime_cfg = CONFIG.get("runtime", {})
         staff_cfg = CONFIG.get("staff", {})
@@ -771,317 +918,135 @@ class RuntimeService:
         self.zone_point_mode = runtime_cfg.get("zone_point_mode", "foot")
         self.sit_min_sec = float(runtime_cfg.get("sit_min_sec", 10))
         self.vacant_grace_sec = float(runtime_cfg.get("vacant_grace_sec", 6))
-        self.yolo_conf = float(YOLO_CONFIG.get("conf", 0.35))
-        self.yolo_iou = float(YOLO_CONFIG.get("iou", 0.5))
-        self.yolo_imgsz = int(YOLO_CONFIG.get("imgsz", 640))
-        self.yolo_mode = str(YOLO_CONFIG.get("mode", "predict")).lower().strip()
-        self.reid_active_expire_sec = float(staff_cfg.get("reid_active_expire_sec", 15))
-        self.reid_match_window_sec = float(staff_cfg.get("reid_match_window_sec", 3.0))
-        self.cross_camera_dedupe_window_sec = float(staff_cfg.get("cross_camera_dedupe_window_sec", 8.0))
-        self.cross_camera_dedupe_similarity = float(staff_cfg.get("cross_camera_dedupe_similarity", 0.60))
-        self.customer_active_ttl_sec = float(runtime_cfg.get("customer_active_ttl_sec", 2.5))
-        self.reid_similarity_threshold = float(staff_cfg.get("reid_similarity_threshold", 0.80))
-        self.staff_similarity_threshold = float(staff_cfg.get("staff_similarity_threshold", 0.78))
-        self.reid_merge_for_counts = bool(staff_cfg.get("reid_merge_for_counts", False))
-        self.exclude_staff_from_counts = bool(staff_cfg.get("exclude_staff_from_counts", False))
-        # Camera heartbeat logging interval (seconds)
-        self.camera_heartbeat_sec = float(runtime_cfg.get("camera_heartbeat_sec", 5.0))
-        self._last_camera_heartbeat: Dict[str, float] = {}
-        # Warn if a camera reports zero detections for this many seconds
-        self.camera_no_detection_warn_sec = float(runtime_cfg.get("camera_no_detection_warn_sec", 15.0))
-        self._last_camera_nonzero: Dict[str, float] = {}
-        self.enable_reid = bool(staff_cfg.get("enable_reid", False))
-        self.reid_encoder: Optional[ReIDEncoder] = None
-        self.staff_gallery: Optional[StaffGallery] = None
-        self._last_det_stats_log_ts: Dict[str, float] = {}
-        self._last_pid_canon_log_ts: float = 0.0
-        self._last_pid_canon_ok_log_ts: float = 0.0
+        
+        # Missing attributes restored
+        self.yolo_conf = 0.5
+        self.yolo_iou = 0.5
+        self.yolo_imgsz = 640
+        self.yolo_mode = "track"  # default
+        self.camera_stall_timeout_sec = 60.0
+        self.camera_freeze_max_same_frames = 120
+        self.camera_freeze_diff_threshold = 1.2
+        self.inference_mode = "always"
+        self.motion_diff_threshold = 25.0
+        self.motion_min_area_ratio = 0.005
+        self.motion_recheck_sec = 2.0
+        self.motion_hold_sec = 5.0
+        self.motion_downscale_width = 128
+        self.customer_active_ttl_sec = 10.0
+        self.dashboard_presence_ttl_sec = 60.0
+        self.no_detection_hold_sec = 2.0
+        self.reid_similarity_threshold = 0.75
+        self.staff_similarity_threshold = 0.82
+        self.reid_active_expire_sec = 3600.0  # 1 hour memory by default
+        self.reid_match_window_sec = 30.0
+        self.cross_camera_dedupe_window_sec = 15.0
+        self.cross_camera_dedupe_similarity = 0.75
+        self.reid_merge_for_counts = True
+        self.exclude_staff_from_counts = True
+        self._last_det_stats_log_ts = {}
+        self._last_process_ts = {}
+        self._last_camera_heartbeat = {}
+        self._last_pid_canon_log_ts = 0
+        self._last_pid_canon_ok_log_ts = 0
+        self._last_camera_nonzero = {}
+        self.camera_heartbeat_sec = 30.0
+        self.camera_no_detection_warn_sec = 300.0
+        # Custom classes for fine-grained salon detection.
+        self.person_class_id = int(YOLO_CONFIG.get("person_class_id", 0))
+        self.head_class_id = int(YOLO_CONFIG.get("head_class_id", 1))
+        self.staff_uniform_class_id = int(YOLO_CONFIG.get("staff_uniform_class_id", 2))
+        class_ids_cfg = YOLO_CONFIG.get(
+            "detect_class_ids",
+            [self.person_class_id, self.head_class_id, self.staff_uniform_class_id],
+        )
+        self.yolo_detect_class_ids = [int(x) for x in class_ids_cfg if x is not None]
+        self.staff_uniform_iou_threshold = float(
+            runtime_cfg.get("staff_uniform_iou_threshold", 0.20)
+        )
+        self.enable_staff_uniform = bool(runtime_cfg.get("enable_staff_uniform", True))
+        
+        self._motion_prev_gray: Dict[str, np.ndarray] = {}
+        self._motion_last_trigger_ts: Dict[str, float] = {}
+        self._motion_last_infer_ts: Dict[str, float] = {}
+        self._motion_last_ratio: Dict[str, float] = {}
+        self._motion_last_mean_diff: Dict[str, float] = {}
+        
+        # Load specific dwell times from config (Fix for duplicate counting)
+        # Default to robust values if config is missing: Chair=2min, Wash=1min
+        dwell_cfg = CONFIG.get("dwell_time", {})
+        self.sit_time_haircut = float(dwell_cfg.get("haircut", 120.0))
+        self.sit_time_wash = float(dwell_cfg.get("wash", 60.0))
+        
+        # Robust vacancy grace period for services
+        # If a person is occluded for < 2 mins (120s), do NOT reset the session.
+        # This prevents "double counting" when detection flickers or barber blocks view.
+        self.service_vacant_grace_sec = 120.0
 
+        configured_stall_timeout = float(runtime_cfg.get("camera_stall_timeout_sec", 8.0))
+        # ... (lines 922-1002 unchanged) ...
         self.global_id_manager = GlobalIDManager()
         self.active_person_memory = ActivePersonMemory()
-        self.haircut_counter = ZoneSessionCounter("HAIRCUT", self.sit_min_sec, self.vacant_grace_sec)
-        self.wash_counter = ZoneSessionCounter("WASH", self.sit_min_sec, self.vacant_grace_sec)
+        
+        # Use specific dwell times and robust grace period
+        self.haircut_counter = ZoneSessionCounter("HAIRCUT", self.sit_time_haircut, self.service_vacant_grace_sec)
+        self.wash_counter = ZoneSessionCounter("WASH", self.sit_time_wash, self.service_vacant_grace_sec)
+        
+        # Log the configuration for verification
+        logger.info(
+            f"Counter Config: Haircut(dwell={self.sit_time_haircut}s, grace={self.service_vacant_grace_sec}s), "
+            f"Wash(dwell={self.sit_time_wash}s, grace={self.service_vacant_grace_sec}s)"
+        )
+        
         self.wait_realtime = 0
         self.live_customers = 0
-        self.realtime_counts: Dict[str, object] = {
+        self.realtime_counts = {
             "chairs_total": 0,
             "washes_total": 0,
             "waits_total": 0,
             "chairs_by_zone": {},
             "washes_by_zone": {},
         }
-        self.recent_haircut_reid: List[Dict] = []
+        self.recent_haircut_reid = []
         
-        self._setup_cameras()
-        self._load_zones()
-        self._setup_dirs()
-        self._setup_supabase()
-        self._setup_reid()
-        self._write_dashboard_state()
-
-    def _setup_reid(self):
-        if not self.enable_reid:
-            logger.info("ReID disabled in config")
-            return
-        try:
-            device = "cpu"
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif (
-                platform.system() != "Darwin"
-                and hasattr(torch.backends, "mps")
-                and torch.backends.mps.is_available()
-            ):
-                device = "mps"
-            self.reid_encoder = ReIDEncoder(device=device)
-            staff_db_path = PATHS_CONFIG.get("staff_db", "data/staff_gallery/staff_db.json")
-
-            # If staff DB doesn't exist at runtime, attempt to auto-build it from
-            # a shipped `staff_gallery` directory (useful for first-run installs).
-            try:
-                if not os.path.exists(staff_db_path):
-                    gallery_dir = PATHS_CONFIG.get("staff_gallery", "data/staff_gallery")
-                    if os.path.exists(gallery_dir) and any(
-                        os.path.isdir(os.path.join(gallery_dir, p)) for p in os.listdir(gallery_dir)
-                    ):
-                        try:
-                            from runtime.build_staff_db import build_staff_db
-                            logger.info(f"Auto-building staff DB from gallery: {gallery_dir}")
-                            report = build_staff_db(
-                                staff_gallery_dir=str(gallery_dir),
-                                output_path=str(staff_db_path),
-                                save_crops=False,
-                            )
-                            logger.info(f"Auto-build complete: staff={report.total_staff} images={report.total_images}")
-                        except Exception as e:
-                            logger.warning(f"Auto-build staff DB failed: {e}")
-                    else:
-                        logger.warning(f"Staff DB not found and no gallery present: {staff_db_path}")
-
-            except Exception:
-                pass
-
-            self.staff_gallery = StaffGallery(staff_db_path)
-            logger.info(f"ReID enabled with device={device}")
-        except Exception as e:
-            logger.error(f"ReID setup failed: {e}")
-            self.reid_encoder = None
-            self.staff_gallery = None
+        # Staff identification: prefer uniform class over ReID embeddings.
+        self.enable_reid = bool(staff_cfg.get("enable_reid", False))
+        if self.enable_staff_uniform and self.enable_reid:
+            logger.warning("enable_reid is ignored because runtime.enable_staff_uniform=True")
             self.enable_reid = False
-
-    def _write_dashboard_state(self, last_event: Optional[Dict] = None):
-        """Write runtime dashboard state to JSON for cross-process controller polling."""
-        try:
-            state = {
-                "timestamp": time.time(),
-                "status": self.get_status(),
-                "summary": self.get_status().get("summary", {}),
-            }
-            if last_event is not None:
-                state["last_event"] = last_event
-
-            state_path = Path(DASHBOARD_STATE_FILE)
-            state_path.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(
-                prefix="dashboard_state_",
-                suffix=".tmp",
-                dir=str(state_path.parent),
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False)
-            os.replace(tmp_path, str(state_path))
-        except Exception as e:
-            logger.debug(f"Failed to write dashboard state: {e}")
-    
-    def _load_yolo(self) -> YOLO:
-        """Load YOLO model"""
-        if not os.path.exists(YOLO_MODEL_PATH):
-            logger.error(f"YOLO model not found: {YOLO_MODEL_PATH}")
-            raise FileNotFoundError(f"YOLO model: {YOLO_MODEL_PATH}")
-
-        device = str(YOLO_CONFIG.get("device", "auto")).lower().strip()
-        if device == "auto":
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif (
-                platform.system() != "Darwin"
-                and hasattr(torch.backends, "mps")
-                and torch.backends.mps.is_available()
-            ):
-                device = "mps"
-            else:
-                device = "cpu"
-        logger.info(f"Loading YOLO model: {YOLO_MODEL_PATH} on {device}")
-
-        model = YOLO(YOLO_MODEL_PATH)
-        try:
-            model.to(device)
-        except Exception as e:
-            if device != "cpu":
-                logger.warning(f"YOLO device '{device}' failed ({e}), falling back to cpu")
-                model.to("cpu")
-                device = "cpu"
-            else:
-                raise
-        return model
-    
-    def _setup_cameras(self):
-        """Initialize cameras"""
-        for cam_name, cam_config in CAMERAS_CONFIG.items():
-            if cam_config.get("enabled", True):
-                rtsp_url = cam_config.get("rtsp_url", "")
-                cam_stream = CameraStream(cam_name, rtsp_url)
-                self.cameras[cam_name] = cam_stream
-                
-                # Register with watchdog
-                self.watchdog.register_camera(cam_name)
-    
-    def _load_zones(self):
-        """Load zones"""
-        for cam_name in self.cameras:
-            zones = load_zones(cam_name)
-            self.zones[cam_name] = zones
-    
-    def _setup_dirs(self):
-        """Create directories"""
-        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-        os.makedirs(REPORTS_DIR, exist_ok=True)
-    
-    def _setup_supabase(self):
-        """Setup Supabase integration"""
-        url = SUPABASE_CONFIG.get("url", "")
-        key = SUPABASE_CONFIG.get("key", "")
-        branch = CONFIG.get("branch_code", "DEMO")
-        
-        if url and key:
+        self.reid_encoder = None
+        if self.enable_reid:
             try:
-                events_table = str(SUPABASE_CONFIG.get("events_table", "events"))
-                self.supabase_client = SupabaseClient(url, key, branch, events_table, logger)
-                self.supabase_sync = SupabaseSync(
-                    self.supabase_client,
-                    heartbeat_interval=HEARTBEAT_INTERVAL,
-                    logger=logger
-                )
-                logger.info("Supabase integration enabled")
+                # MPS support for ReID (ResNet50) can be flaky on some MacOS versions, fallback to CPU if needed
+                reid_device = self.yolo_device if self.yolo_device != "mps" else "cpu"
+                self.reid_encoder = ReIDEncoder(device=reid_device)
             except Exception as e:
-                logger.error(f"Error setting up Supabase: {e}")
-        else:
-            logger.warning("Supabase credentials not configured")
+                logger.error(f"Failed to init ReID encoder: {e}")
+                self.enable_reid = False
+        
+        self.staff_gallery = None
+        if self.enable_reid:
+             self.staff_gallery = StaffGallery("data/staff_db.json")
 
-    def _snapshot_path(self, event_type: str, camera: str, person_id: int, gid: int = 0) -> Path:
-        day = datetime.now().strftime("%Y-%m-%d")
-        d = Path(SNAPSHOT_DIR) / day
-        d.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")[:-3]
-        return d / f"{ts}_gid{gid}_{event_type}_{camera}_pid{person_id}.jpg"
+        self._apply_runtime_settings(CONFIG.get("runtime_tunable", {}))
+        
+        # Restore dashboard state
+        if os.path.exists(DASHBOARD_STATE_FILE):
+             try:
+                 with open(DASHBOARD_STATE_FILE, "r") as f:
+                     state = json.load(f)
+                     self.haircut_counter.total_count = int(state.get("haircut_count", 0))
+                     self.wash_counter.total_count = int(state.get("wash_count", 0))
+                     if "haircut_zone_total" in state:
+                         self.haircut_counter.zone_total = state["haircut_zone_total"]
+                     if "wash_zone_total" in state:
+                         self.wash_counter.zone_total = state["wash_zone_total"]
+                     logger.info(f"Restored dashboard state: haircuts={self.haircut_counter.total_count}")
+             except Exception as e:
+                 logger.error(f"Failed to restore dashboard state: {e}")
 
-    def _zone_centroid(self, poly: List[Tuple[float, float]]) -> Tuple[float, float]:
-        if not poly:
-            return (0.0, 0.0)
-        xs = [float(p[0]) for p in poly]
-        ys = [float(p[1]) for p in poly]
-        return (sum(xs) / len(xs), sum(ys) / len(ys))
-
-    def _pick_primary_business_zone(
-        self,
-        zone_hits: List[str],
-        center_xy: Optional[Tuple[float, float]] = None,
-        zones: Optional[Dict[str, List[Tuple[float, float]]]] = None,
-    ) -> Optional[str]:
-        chairs = [z for z in zone_hits if str(z).startswith(CHAIR_ZONE_PREFIX)]
-        if chairs:
-            if center_xy is not None and zones:
-                cx, cy = center_xy
-                chairs = sorted(
-                    chairs,
-                    key=lambda z: (self._zone_centroid(zones.get(z, []))[0] - cx) ** 2
-                    + (self._zone_centroid(zones.get(z, []))[1] - cy) ** 2,
-                )
-            else:
-                chairs = sorted(chairs)
-            return chairs[0]
-        washes = sorted([z for z in zone_hits if str(z).startswith(WASH_ZONE_PREFIX)])
-        if washes:
-            return washes[0]
-        waits = [z for z in zone_hits if z in WAIT_ZONE_NAMES]
-        if waits:
-            return "WAIT"
-
-        # Fallback: if no zone point hit (bbox on border), snap to nearest chair centroid.
-        if center_xy is not None and zones:
-            cx, cy = center_xy
-            chair_candidates = [z for z in zones.keys() if str(z).startswith(CHAIR_ZONE_PREFIX)]
-            if chair_candidates:
-                nearest = min(
-                    chair_candidates,
-                    key=lambda z: (self._zone_centroid(zones.get(z, []))[0] - cx) ** 2
-                    + (self._zone_centroid(zones.get(z, []))[1] - cy) ** 2,
-                )
-                nx, ny = self._zone_centroid(zones.get(nearest, []))
-                if ((nx - cx) ** 2 + (ny - cy) ** 2) <= (0.20 ** 2):
-                    return nearest
-        return None
-
-    def _detect_zone_hits(
-        self,
-        zones: Dict[str, List[Tuple[float, float]]],
-        x1: float,
-        y1: float,
-        x2: float,
-        y2: float,
-        w: int,
-        h: int,
-    ) -> List[str]:
-        """Find zones hit by this detection using selected point mode + fallback points."""
-        if w <= 0 or h <= 0:
-            return []
-
-        cx = ((x1 + x2) / 2.0) / float(w)
-        cy_center = ((y1 + y2) / 2.0) / float(h)
-        cy_foot = y2 / float(h)
-        left_foot = (x1 / float(w), cy_foot)
-        right_foot = (x2 / float(w), cy_foot)
-
-        if self.zone_point_mode == "center":
-            candidates = [(cx, cy_center), (cx, cy_foot), left_foot, right_foot]
-        else:
-            candidates = [(cx, cy_foot), (cx, cy_center), left_foot, right_foot]
-
-        zone_hits: List[str] = []
-        for zn, poly in zones.items():
-            for px, py in candidates:
-                if point_in_polygon((px, py), poly):
-                    zone_hits.append(zn)
-                    break
-        return zone_hits
-
-    def _assign_fallback_local_vid(self, camera_name: str, cx: float, cy: float, ts: float) -> int:
-        """Assign stable per-camera local id when YOLO tracker id is unavailable."""
-        max_age = 2.0
-        max_dist2 = 0.08 ** 2
-        with self._fallback_track_lock:
-            cam_tracks = self._fallback_tracks.setdefault(camera_name, {})
-            # expire stale fallback tracks
-            dead = [tid for tid, info in cam_tracks.items() if (ts - float(info.get("ts", 0.0))) > max_age]
-            for tid in dead:
-                cam_tracks.pop(tid, None)
-
-            best_tid = None
-            best_d2 = float("inf")
-            for tid, info in cam_tracks.items():
-                dx = float(info.get("cx", 0.0)) - cx
-                dy = float(info.get("cy", 0.0)) - cy
-                d2 = dx * dx + dy * dy
-                if d2 < best_d2 and d2 <= max_dist2:
-                    best_d2 = d2
-                    best_tid = tid
-
-            if best_tid is None:
-                best_tid = self._next_fallback_tid
-                self._next_fallback_tid += 1
-            cam_tracks[best_tid] = {"cx": cx, "cy": cy, "ts": ts}
-            return int(best_tid)
-
+        self._setup_cameras()
+        
     def _apply_runtime_settings(self, settings: Dict):
         """Apply runtime-tunable parameters from controller."""
         try:
@@ -1096,15 +1061,52 @@ class RuntimeService:
                 if mode in ("predict", "track"):
                     self.yolo_mode = mode
             if "sit_min_sec" in settings:
+                # Update global default, but DO NOT overwrite specific service counters
                 self.sit_min_sec = float(settings["sit_min_sec"])
-                self.haircut_counter.sit_min_sec = self.sit_min_sec
-                self.wash_counter.sit_min_sec = self.sit_min_sec
+                # self.haircut_counter.sit_min_sec = self.sit_min_sec
+                # self.wash_counter.sit_min_sec = self.sit_min_sec
             if "vacant_grace_sec" in settings:
+                # Update global default, but DO NOT overwrite specific service counters
                 self.vacant_grace_sec = float(settings["vacant_grace_sec"])
-                self.haircut_counter.vacant_grace_sec = self.vacant_grace_sec
-                self.wash_counter.vacant_grace_sec = self.vacant_grace_sec
+                # self.haircut_counter.vacant_grace_sec = self.vacant_grace_sec
+                # self.wash_counter.vacant_grace_sec = self.vacant_grace_sec
+            if "camera_stall_timeout_sec" in settings:
+                requested_stall = float(settings["camera_stall_timeout_sec"])
+                min_stall = 60.0 if self.yolo_device == "cpu" else 20.0
+                self.camera_stall_timeout_sec = max(min_stall, requested_stall)
+                if self.camera_stall_timeout_sec != requested_stall:
+                    logger.warning(
+                        f"camera_stall_timeout_sec={requested_stall:.1f}s is too low for {self.yolo_device} mode; "
+                        f"clamped to {self.camera_stall_timeout_sec:.1f}s"
+                    )
+            if "camera_freeze_max_same_frames" in settings:
+                self.camera_freeze_max_same_frames = int(settings["camera_freeze_max_same_frames"])
+            if "camera_freeze_diff_threshold" in settings:
+                self.camera_freeze_diff_threshold = float(settings["camera_freeze_diff_threshold"])
+            if "inference_mode" in settings:
+                mode = str(settings["inference_mode"]).lower().strip()
+                if mode in ("always", "motion_gated"):
+                    self.inference_mode = mode
+            if "motion_diff_threshold" in settings:
+                self.motion_diff_threshold = max(0.5, float(settings["motion_diff_threshold"]))
+            if "motion_min_area_ratio" in settings:
+                self.motion_min_area_ratio = min(max(float(settings["motion_min_area_ratio"]), 0.0001), 1.0)
+            if "motion_recheck_sec" in settings:
+                self.motion_recheck_sec = max(0.5, float(settings["motion_recheck_sec"]))
+            if "motion_hold_sec" in settings:
+                self.motion_hold_sec = max(0.0, float(settings["motion_hold_sec"]))
+            if "motion_downscale_width" in settings:
+                self.motion_downscale_width = max(64, int(settings["motion_downscale_width"]))
+            if "enable_staff_uniform" in settings:
+                self.enable_staff_uniform = bool(settings["enable_staff_uniform"])
+            if "staff_uniform_iou_threshold" in settings:
+                self.staff_uniform_iou_threshold = max(0.0, min(1.0, float(settings["staff_uniform_iou_threshold"])))
             if "customer_active_ttl_sec" in settings:
                 self.customer_active_ttl_sec = float(settings["customer_active_ttl_sec"])
+            if "dashboard_presence_ttl_sec" in settings:
+                self.dashboard_presence_ttl_sec = float(settings["dashboard_presence_ttl_sec"])
+            if "no_detection_hold_sec" in settings:
+                self.no_detection_hold_sec = float(settings["no_detection_hold_sec"])
             if "resource_max_memory_percent" in settings:
                 self.resource_guard.max_memory_percent = float(settings["resource_max_memory_percent"])
             if "throttle_log_interval_sec" in settings:
@@ -1227,9 +1229,6 @@ class RuntimeService:
             pid = int(d.get("pid", 0))
             if pid <= 0:
                 continue
-            emb = d.get("emb")
-            if emb is None:
-                continue
             prev = by_pid.get(pid)
             if prev is None or float(d.get("ts", 0.0)) > float(prev.get("ts", 0.0)):
                 by_pid[pid] = d
@@ -1281,6 +1280,18 @@ class RuntimeService:
                 if zi and zj and zi == zj and (
                     zi.startswith(CHAIR_ZONE_PREFIX) or zi.startswith(WASH_ZONE_PREFIX)
                 ):
+                    if union(pids[i], pids[j]):
+                        merged_groups += 1
+                    continue
+
+                # ReID-disabled fallback: if both are in the same business zone family
+                # (CHAIR_* or WASH*), near-simultaneous, and from different cameras,
+                # treat as the same person to avoid duplicate counting across angles.
+                same_family = (
+                    (zi.startswith(CHAIR_ZONE_PREFIX) and zj.startswith(CHAIR_ZONE_PREFIX))
+                    or (zi.startswith(WASH_ZONE_PREFIX) and zj.startswith(WASH_ZONE_PREFIX))
+                )
+                if same_family and (ei is None and dj.get("emb") is None):
                     if union(pids[i], pids[j]):
                         merged_groups += 1
                     continue
@@ -1477,7 +1488,17 @@ class RuntimeService:
             h, w = frame.shape[:2]
             # Guard ultralytics model forward pass with a lock to avoid concurrent
             # model mutation/runtime crashes across camera threads on CPU/MPS.
-            with self.yolo_lock:
+            # Use timeout so one slow inference does not block all camera loops.
+            acquired = self.yolo_lock.acquire(timeout=2.0)
+            if not acquired:
+                now_ts = time.time()
+                last_log = float(self._last_det_stats_log_ts.get(camera_name, 0.0))
+                if (now_ts - last_log) >= 5.0:
+                    self._last_det_stats_log_ts[camera_name] = now_ts
+                    logger.warning(f"{camera_name}: YOLO busy >2s, skipping frame to keep stream alive")
+                return
+            try:
+                detect_classes = self.yolo_detect_class_ids if self.yolo_detect_class_ids else None
                 if self.yolo_mode == "track":
                     try:
                         results = self.yolo_model.track(
@@ -1486,7 +1507,7 @@ class RuntimeService:
                             conf=self.yolo_conf,
                             iou=self.yolo_iou,
                             imgsz=self.yolo_imgsz,
-                            classes=[0],
+                            classes=detect_classes,
                             tracker="bytetrack.yaml",
                             verbose=False
                         )
@@ -1497,7 +1518,7 @@ class RuntimeService:
                             conf=self.yolo_conf,
                             iou=self.yolo_iou,
                             imgsz=self.yolo_imgsz,
-                            classes=[0],
+                            classes=detect_classes,
                             verbose=False
                         )
                 else:
@@ -1507,47 +1528,99 @@ class RuntimeService:
                         conf=self.yolo_conf,
                         iou=self.yolo_iou,
                         imgsz=self.yolo_imgsz,
-                        classes=[0],
+                        classes=detect_classes,
                         verbose=False
                     )
+            finally:
+                self.yolo_lock.release()
 
             now_ts = time.time()
             zones = self.zones.get(camera_name, {})
             detections: List[Detection] = []
             customers: List[Dict] = []
             raw_people = 0
+            raw_heads = 0
+            raw_staff_uniform = 0
             staff_filtered = 0
             emb_ready = 0
 
             if results and results[0].boxes is not None:
                 boxes = results[0].boxes
                 ids = boxes.id
+                cls_vals = boxes.cls
                 if ids is None:
                     last_log = float(self._last_noid_log_ts.get(camera_name, 0.0))
                     if (now_ts - last_log) >= 5.0:
                         logger.info(f"{camera_name}: tracker ids unavailable, using fallback local ids")
                         self._last_noid_log_ts[camera_name] = now_ts
                 xyxy_list = list(boxes.xyxy)
+                staff_uniform_boxes: List[List[float]] = []
                 for i, box in enumerate(xyxy_list):
-                    raw_people += 1
+                    cls_id = (
+                        int(float(cls_vals[i].item()))
+                        if cls_vals is not None and i < len(cls_vals)
+                        else self.person_class_id
+                    )
+                    if cls_id == self.staff_uniform_class_id:
+                        x1s, y1s, x2s, y2s = box.cpu().numpy().tolist()
+                        raw_staff_uniform += 1
+                        staff_uniform_boxes.append([float(x1s), float(y1s), float(x2s), float(y2s)])
+
+                for i, box in enumerate(xyxy_list):
+                    cls_id = (
+                        int(float(cls_vals[i].item()))
+                        if cls_vals is not None and i < len(cls_vals)
+                        else self.person_class_id
+                    )
+                    if cls_id not in (self.person_class_id, self.head_class_id):
+                        continue
                     x1, y1, x2, y2 = box.cpu().numpy().tolist()
                     conf = float(boxes.conf[i]) if boxes.conf is not None else 0.0
+                    is_head = cls_id == self.head_class_id
+                    if is_head:
+                        raw_heads += 1
+                    else:
+                        raw_people += 1
                     x1_norm, y1_norm = x1 / w, y1 / h
                     x2_norm, y2_norm = x2 / w, y2 / h
-                    detections.append(Detection(x1_norm, y1_norm, x2_norm, y2_norm, conf, 0))
+                    detections.append(Detection(x1_norm, y1_norm, x2_norm, y2_norm, conf, int(cls_id)))
 
                     cx = ((x1 + x2) / 2.0) / max(w, 1)
                     cy = y2 / max(h, 1)
-                    zone_hits = self._detect_zone_hits(zones, x1, y1, x2, y2, w, h)
+                    # For head-only detections, center point is more stable than foot point.
+                    zone_hits = self._detect_zone_hits(
+                        zones,
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        w,
+                        h,
+                        forced_mode=("center" if is_head else None),
+                    )
                     primary_zone = self._pick_primary_business_zone(
                         zone_hits,
                         center_xy=(cx, cy),
                         zones=zones,
                     )
+                    # Head-only objects should contribute to dwell mainly in service zones.
+                    if is_head and primary_zone is not None:
+                        pz = str(primary_zone)
+                        if (not pz.startswith(CHAIR_ZONE_PREFIX)) and \
+                           (not pz.startswith(WASH_ZONE_PREFIX)) and \
+                           (pz not in WAIT_ZONE_NAMES):
+                            primary_zone = None
 
                     emb = None
                     staff_id = None
-                    if self.enable_reid and self.reid_encoder is not None:
+                    if self.enable_staff_uniform and staff_uniform_boxes:
+                        cur_box = [float(x1), float(y1), float(x2), float(y2)]
+                        for sb in staff_uniform_boxes:
+                            if self._bbox_iou_xyxy(cur_box, sb) >= self.staff_uniform_iou_threshold:
+                                staff_id = "staff_uniform"
+                                break
+
+                    if staff_id is None and self.enable_reid and self.reid_encoder is not None:
                         x1i, y1i, x2i, y2i = map(int, [x1, y1, x2, y2])
                         x1i = max(0, x1i)
                         y1i = max(0, y1i)
@@ -1579,6 +1652,7 @@ class RuntimeService:
                         "zones": zone_hits,
                         "primary_zone": primary_zone,
                         "staff_id": staff_id,
+                        "det_type": "head" if is_head else "person",
                         "ts": now_ts,
                         "emb": emb,
                     }
@@ -1597,6 +1671,8 @@ class RuntimeService:
                     customers.append(det)
 
             self.tracker.update(camera_name, detections)
+            if (raw_people + raw_heads) > 0:
+                self._last_camera_nonzero[camera_name] = now_ts
             with self.customers_lock:
                 if customers:
                     self.latest_customers[camera_name] = customers
@@ -1605,10 +1681,17 @@ class RuntimeService:
                     # on brief detector misses (matches dashboard "real-time but stable").
                     prev = self.latest_customers.get(camera_name, [])
                     kept = []
+                    last_nonzero = float(self._last_camera_nonzero.get(camera_name, 0.0))
+                    hold_stale = (last_nonzero > 0.0) and ((now_ts - last_nonzero) <= self.no_detection_hold_sec)
                     for d in prev:
                         ts = float(d.get("ts", 0.0))
-                        if ts > 0 and (now_ts - ts) <= self.customer_active_ttl_sec:
-                            kept.append(d)
+                        if ts > 0 and (now_ts - ts) <= self.dashboard_presence_ttl_sec:
+                            if hold_stale:
+                                nd = dict(d)
+                                nd["ts"] = now_ts
+                                kept.append(nd)
+                            else:
+                                kept.append(d)
                     self.latest_customers[camera_name] = kept
                 self.latest_frames[camera_name] = frame.copy()
 
@@ -1616,7 +1699,8 @@ class RuntimeService:
             if (now_ts - last_log) >= 5.0:
                 self._last_det_stats_log_ts[camera_name] = now_ts
                 logger.info(
-                    f"{camera_name}: raw={raw_people} accepted={len(customers)} "
+                    f"{camera_name}: raw_person={raw_people} raw_head={raw_heads} "
+                    f"raw_staff_uniform={raw_staff_uniform} accepted={len(customers)} "
                     f"staff_filtered={staff_filtered} emb_ready={emb_ready} "
                     f"ids={'ok' if (results and results[0].boxes is not None and results[0].boxes.id is not None) else 'fallback'}"
                 )
@@ -1624,15 +1708,35 @@ class RuntimeService:
         except Exception as e:
             logger.error(f"Error processing frame from {camera_name}: {e}")
     
-    def run_camera_thread(self, camera_name: str):
+    def run_camera_thread(self, camera_name: str, generation: Optional[int] = None):
         """Thread for single camera with watchdog"""
-        logger.info(f"Starting camera thread: {camera_name}")
-        cam_stream = self.cameras[camera_name]
+        if generation is None:
+            generation = int(self._camera_generation.get(camera_name, 0))
+        logger.info(f"Starting camera thread: {camera_name} gen={generation}")
         frame_count = 0
         failure_count = 0
 
         while self.running:
             try:
+                current_gen = int(self._camera_generation.get(camera_name, 0))
+                if generation != current_gen:
+                    logger.info(f"Stopping stale camera thread: {camera_name} gen={generation} current={current_gen}")
+                    return
+
+                with self._camera_lock:
+                    cam_stream = self.cameras.get(camera_name)
+                if cam_stream is None:
+                    time.sleep(0.5)
+                    continue
+
+                if cam_stream.reconnect_requested or (not cam_stream.is_connected):
+                    try:
+                        cam_stream.connect()
+                    except Exception:
+                        logger.exception(f"{camera_name}: reconnect request failed")
+                    finally:
+                        cam_stream.reconnect_requested = False
+
                 # Check throttle status
                 self._check_control_commands()
                 if self.resource_guard.should_throttle():
@@ -1650,7 +1754,10 @@ class RuntimeService:
                     # brief throttling periods.
                     try:
                         with self.customers_lock:
-                            grace = max(1.0, float(self.customer_active_ttl_sec))
+                            grace = max(
+                                1.0,
+                                float(max(self.customer_active_ttl_sec, self.dashboard_presence_ttl_sec)),
+                            )
                             for cam, prev in list(self.latest_customers.items()):
                                 refreshed: List[Dict] = []
                                 for d in prev:
@@ -1674,7 +1781,7 @@ class RuntimeService:
                     self.watchdog.mark_frame_failed(camera_name, "Frame read failed")
                     failure_count += 1
                     # After several consecutive failures try reconnecting
-                    if failure_count >= 5:
+                    if failure_count >= 3:
                         logger.info(f"{camera_name}: repeated frame failures, attempting reconnect")
                         try:
                             cam_stream.connect()
@@ -1692,7 +1799,76 @@ class RuntimeService:
 
                 # successful read, reset failure counter
                 failure_count = 0
-                self.process_frame(camera_name, frame)
+                now_ts = time.time()
+                self._last_frame_ok_ts[camera_name] = now_ts
+                good_frames = int(self._camera_good_frame_count.get(camera_name, 0)) + 1
+                self._camera_good_frame_count[camera_name] = good_frames
+                # Camera is healthy again, clear reconnect backoff.
+                self._restart_backoff_sec[camera_name] = 0.0
+                self._restart_backoff_until[camera_name] = 0.0
+                if good_frames >= int(max(30, self.target_fps * 20)):
+                    if self._stall_restart_count.get(camera_name, 0) != 0:
+                        logger.info(f"{camera_name}: stable frame reads restored, resetting stall counter")
+                    self._stall_restart_count[camera_name] = 0
+                    base_policy = {
+                        "prefer_tcp": bool(RUNTIME_CONFIG.get("rtsp_prefer_tcp", False)),
+                        "force_ffmpeg": bool(RUNTIME_CONFIG.get("rtsp_force_ffmpeg", False)),
+                        "allow_udp_fallback": bool(RUNTIME_CONFIG.get("rtsp_allow_udp_fallback", False)),
+                        "rotate_backends": bool(RUNTIME_CONFIG.get("rtsp_rotate_backends", False)),
+                    }
+                    if self._camera_connect_policy.get(camera_name) != base_policy:
+                        self._camera_connect_policy[camera_name] = dict(base_policy)
+                        logger.info(f"{camera_name}: restoring base connect policy after stable read period")
+
+                # Keep reading frames continuously to prevent RTSP/FFmpeg buffer
+                # buildup; only run heavy inference at target_fps cadence.
+                min_process_interval = 1.0 / max(float(self.target_fps), 1.0)
+                last_proc = float(self._last_process_ts.get(camera_name, 0.0))
+                
+                # OPTIMIZATION: Also skip UI frame updates if they are happening too fast.
+                # Cap UI updates at 10 FPS to save memory bandwidth (copies).
+                min_ui_interval = 0.1 
+                
+                if (now_ts - last_proc) < min_process_interval:
+                    # Skip inference
+                    
+                    # Check if we should update UI frame
+                    if not hasattr(self, "_last_ui_update_ts"):
+                         self._last_ui_update_ts = {}
+                    
+                    if (now_ts - float(self._last_ui_update_ts.get(camera_name, 0.0))) >= min_ui_interval:
+                        with self.customers_lock:
+                            self.latest_frames[camera_name] = frame.copy()
+                        self._last_ui_update_ts[camera_name] = now_ts
+
+                    # short yield, but do not sleep by target_fps here
+                    time.sleep(0.002)
+                    continue
+                self._last_process_ts[camera_name] = now_ts
+
+                should_infer, infer_reason = self._should_run_inference(camera_name, frame, now_ts)
+                if should_infer:
+                    self.process_frame(camera_name, frame)
+                    self._motion_last_infer_ts[camera_name] = now_ts
+                else:
+                    # Skip heavy YOLO pass during motion-gated idle windows.
+                    # Keep recent customers alive briefly to avoid dashboard flicker.
+                    with self.customers_lock:
+                        prev = self.latest_customers.get(camera_name, [])
+                        refreshed: List[Dict] = []
+                        keep_sec = max(self.motion_recheck_sec * 2.0, self.customer_active_ttl_sec)
+                        for d in prev:
+                            ts = float(d.get("ts", 0.0))
+                            if ts > 0 and (now_ts - ts) <= keep_sec:
+                                nd = dict(d)
+                                nd["ts"] = now_ts
+                                refreshed.append(nd)
+                        self.latest_customers[camera_name] = refreshed
+                        self.latest_frames[camera_name] = frame.copy()
+                    last_log = float(self._last_det_stats_log_ts.get(camera_name, 0.0))
+                    if (now_ts - last_log) >= 5.0:
+                        self._last_det_stats_log_ts[camera_name] = now_ts
+                        logger.info(f"{camera_name}: inference skipped ({infer_reason})")
 
                 # Per-camera heartbeat log to show ongoing detection activity
                 try:
@@ -1727,7 +1903,8 @@ class RuntimeService:
                     self._broadcast_status()
                     self.last_health_broadcast = current_time
 
-                time.sleep(1.0 / max(TARGET_FPS, 1))
+                # Keep capture loop responsive; inference cadence is controlled above.
+                time.sleep(0.002)
             except Exception as e:
                 logger.exception(f"Unexpected error in camera thread {camera_name}: {e}")
                 time.sleep(1.0)
@@ -1782,8 +1959,9 @@ class RuntimeService:
                     self.last_report_time = now
                 
                 # Log and broadcast summary
+                status_now = self.get_status()
                 summary = {
-                    "active_people": self.live_customers,
+                    "active_people": int(status_now.get("active_tracks", self.live_customers)),
                     "haircuts": self.haircut_counter.total_count,
                     "washes": self.wash_counter.total_count,
                     "waits": self.wait_realtime,
@@ -1795,14 +1973,330 @@ class RuntimeService:
                 if current_time - self.last_summary_broadcast > 5.0:
                     self._broadcast_summary(summary)
                     self.last_summary_broadcast = current_time
-                    self._write_dashboard_state()
+                self._write_dashboard_state()
                 
+                # Explicit GC to prevent memory creep
+                gc.collect()
                 time.sleep(10)
             
             except Exception as e:
                 logger.error(f"Error in event submission loop: {e}")
                 time.sleep(5)
     
+    def _load_yolo(self) -> Tuple[YOLO, str]:
+        """Load YOLO model and detect best device."""
+        model_name = YOLO_CONFIG.get("model", "yolov8m.pt")
+        model_path = Path(YOLO_MODEL_PATH)
+        
+        model_to_load = ""
+        if model_path.exists():
+            model_to_load = str(model_path)
+        else:
+            logger.warning(f"YOLO model not found at {model_path}. Attempting to download '{model_name}'...")
+            model_to_load = model_name
+            
+        device = str(YOLO_CONFIG.get("device", "auto")).lower().strip()
+        if device == "auto":
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif (
+                platform.system() != "Darwin"
+                and hasattr(torch.backends, "mps")
+                and torch.backends.mps.is_available()
+            ):
+                device = "mps"
+            else:
+                device = "cpu"
+                
+        logger.info(f"Loading YOLO model: {model_to_load} on {device}")
+        
+        try:
+            model = YOLO(model_to_load)
+        except Exception as e:
+            logger.error(f"Failed to load/download YOLO model '{model_to_load}': {e}")
+            raise e
+            
+        try:
+            model.to(device)
+        except Exception as e:
+            if device != "cpu":
+                logger.warning(f"YOLO device '{device}' failed ({e}), falling back to cpu")
+                model.to("cpu")
+                device = "cpu"
+            else:
+                raise e
+                
+        return model, device
+
+    def _snapshot_path(self, event_type: str, camera: str, pid: int, gid: int = 0) -> Path:
+        """Generate snapshot path."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_cam = "".join(c for c in camera if c.isalnum() or c in ('_', '-'))
+        filename = f"{ts}_{event_type}_{safe_cam}_P{pid}_G{gid}.jpg"
+        return Path(SNAPSHOT_DIR) / filename
+
+    def _broadcast_status(self):
+        """Broadcast heartbeat status to dashboard."""
+        try:
+            now = time.time()
+            if (now - self.last_status_broadcast) < 1.0:
+                return
+
+            status = {
+                "timestamp": now,
+                "uptime": 0,  # calculated by dashboard
+                "cameras": {},
+                "people_count": self.live_customers,
+                "waiting_count": self.wait_realtime,
+                "haircut_count": self.realtime_counts.get("chairs_total", 0),
+                "wash_count": self.realtime_counts.get("washes_total", 0),
+                "cpu_usage": 0, # placeholder
+                "memory_usage": 0, # placeholder
+            }
+            
+            for name, cam in self.cameras.items():
+                status["cameras"][name] = {
+                    "connected": cam.is_connected,
+                    "fps": getattr(cam, "fps", 0),
+                    "last_frame": self._last_frame_ok_ts.get(name, 0),
+                }
+
+            self.broadcaster.broadcast("status", status)
+            self.last_status_broadcast = now
+            
+            # Send Summary for charts
+            if (now - self.last_summary_broadcast) >= 5.0:
+                summary = {
+                    "active_people": self.live_customers,
+                    "haircuts": self.haircut_counter.total_count,
+                    "washes": self.wash_counter.total_count,
+                    "waits": self.wait_realtime,
+                    "total_events": len(self.all_events),
+                }
+                self.broadcaster.broadcast("summary", summary)
+                self.last_summary_broadcast = now
+                logger.info(f"Summary: {summary}")
+
+        except Exception as e:
+            logger.error(f"Broadcast error: {e}")
+
+    def _broadcast_event(self, event_dict: Dict):
+        """Broadcast new event to dashboard."""
+        try:
+            self.broadcaster.broadcast("new_event", event_dict)
+        except Exception as e:
+            logger.error(f"Event broadcast error: {e}")
+
+    def _write_dashboard_state(self, last_event: Optional[Dict] = None):
+        """Persist state for cross-process dashboard polling."""
+        try:
+            status = self.get_status()
+            data = {
+                "timestamp": time.time(),
+                "status": status,
+                "summary": status.get("summary", {}),
+            }
+            if last_event is not None:
+                data["last_event"] = last_event
+
+            state_path = Path(DASHBOARD_STATE_FILE)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix="dashboard_state_",
+                suffix=".tmp",
+                dir=str(state_path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+                os.replace(tmp_path, str(state_path))
+            finally:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"Failed to write dashboard state: {e}")
+
+    def _setup_cameras(self):
+        """Initialize cameras from config."""
+        for name, cfg in CAMERAS_CONFIG.items():
+            # Handle both string (legacy) and dict (new) config formats
+            if isinstance(cfg, str):
+                url = cfg
+                enabled = True
+            elif isinstance(cfg, dict):
+                url = cfg.get("rtsp_url", "")
+                enabled = bool(cfg.get("enabled", True))
+            else:
+                logger.warning(f"Invalid config for camera {name}: {cfg}")
+                continue
+
+            if not enabled:
+                logger.info(f"Skipping disabled camera: {name}")
+                continue
+
+            logger.info(f"Adding camera: {name}")
+            self._camera_generation[name] = 1
+            self.cameras[name] = CameraStream(name, url)
+            self.zones[name] = load_zones(name)
+
+    def _on_camera_offline(self, camera_name: str):
+        logger.warning(f"Watchdog: Camera {camera_name} is OFFLINE")
+        self.broadcaster.broadcast("camera_status", {"camera": camera_name, "status": "offline"})
+
+    def _on_camera_online(self, camera_name: str):
+        logger.info(f"Watchdog: Camera {camera_name} is ONLINE")
+        self.broadcaster.broadcast("camera_status", {"camera": camera_name, "status": "online"})
+
+    def _on_health_check_failed(self, check_name: str, details: str):
+        logger.error(f"Health Check Failed: {check_name} - {details}")
+        
+    def _detect_zone_hits(
+        self,
+        zones: Dict[str, List[Tuple[float, float]]],
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        w: int,
+        h: int,
+        forced_mode: Optional[str] = None,
+    ) -> List[str]:
+        hits = []
+        if not zones:
+            return hits
+        
+        # Check foot point
+        foot_x = (x1 + x2) / 2.0 / w
+        foot_y = y2 / h
+        foot_pt = (foot_x, foot_y)
+
+        # Check center point
+        center_x = (x1 + x2) / 2.0 / w
+        center_y = (y1 + y2) / 2.0 / h
+        center_pt = (center_x, center_y)
+
+        for name, poly in zones.items():
+            # Use foot point for better floor-plan accuracy
+            mode = forced_mode if forced_mode in ("foot", "center") else self.zone_point_mode
+            target_pt = foot_pt if mode == "foot" else center_pt
+            if point_in_polygon(target_pt, poly):
+                hits.append(name)
+        return hits
+
+    @staticmethod
+    def _bbox_iou_xyxy(a: List[float], b: List[float]) -> float:
+        """IoU between two XYXY pixel bboxes."""
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0.0:
+            return 0.0
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        denom = area_a + area_b - inter
+        if denom <= 0.0:
+            return 0.0
+        return inter / denom
+
+    def _pick_primary_business_zone(self, hits: List[str], center_xy: Tuple[float, float], zones: Dict) -> Optional[str]:
+        # Priority: CHAIR > WASH > WAIT > others
+        if not hits:
+            return None
+        
+        chair = [z for z in hits if z.startswith(CHAIR_ZONE_PREFIX)]
+        if chair:
+            return chair[0]  # Just pick first if multiple
+            
+        wash = [z for z in hits if z.startswith(WASH_ZONE_PREFIX)]
+        if wash:
+            return wash[0]
+
+        wait = [z for z in hits if z in WAIT_ZONE_NAMES]
+        if wait:
+            return wait[0]
+            
+        return hits[0]
+
+    def _assign_fallback_local_vid(self, camera: str, cx: float, cy: float, now: float) -> int:
+        """Assign temporary ID when YOLO tracking fails."""
+        with self._fallback_track_lock:
+            tracks = self._fallback_tracks.setdefault(camera, {})
+            best_id = -1
+            min_dist = 0.15 # Max distance match
+            
+            # Simple distance matching
+            dead = []
+            for tid, info in tracks.items():
+                if (now - info["ts"]) > 2.0:
+                    dead.append(tid)
+                    continue
+                dist = ((cx - info["cx"])**2 + (cy - info["cy"])**2)**0.5
+                if dist < min_dist:
+                    min_dist = dist
+                    best_id = tid
+            
+            for tid in dead:
+                tracks.pop(tid, None)
+
+            if best_id != -1:
+                tracks[best_id] = {"cx": cx, "cy": cy, "ts": now}
+                return best_id
+            
+            new_id = self._next_fallback_tid
+            self._next_fallback_tid += 1
+            tracks[new_id] = {"cx": cx, "cy": cy, "ts": now}
+            return new_id
+
+    def _should_run_inference(self, camera_name: str, frame: np.ndarray, now_ts: float) -> Tuple[bool, str]:
+        """Motion gating logic."""
+        if self.inference_mode == "always":
+            return True, "always"
+
+        # Initialize motion data for camera
+        if camera_name not in self._motion_prev_gray:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, (self.motion_downscale_width, int(self.motion_downscale_width * frame.shape[0] / frame.shape[1])))
+            self._motion_prev_gray[camera_name] = small
+            self._motion_last_trigger_ts[camera_name] = now_ts
+            return True, "init"
+
+        # Check hold time
+        last_trig = self._motion_last_trigger_ts.get(camera_name, 0.0)
+        if (now_ts - last_trig) < self.motion_hold_sec:
+            return True, "hold"
+
+        # Check recheck interval
+        last_infer = self._motion_last_infer_ts.get(camera_name, 0.0)
+        if (now_ts - last_infer) < self.motion_recheck_sec:
+            return False, "interval"
+
+        # Calculate motion
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (self._motion_prev_gray[camera_name].shape[1], self._motion_prev_gray[camera_name].shape[0]))
+        
+        diff = cv2.absdiff(small, self._motion_prev_gray[camera_name])
+        thresh = cv2.threshold(diff, self.motion_diff_threshold, 255, cv2.THRESH_BINARY)[1]
+        
+        motion_ratio = np.sum(thresh > 0) / thresh.size
+        self._motion_last_ratio[camera_name] = motion_ratio
+        
+        self._motion_prev_gray[camera_name] = small
+        
+        if motion_ratio > self.motion_min_area_ratio:
+            self._motion_last_trigger_ts[camera_name] = now_ts
+            return True, f"motion {motion_ratio:.4f}"
+            
+        return False, f"idle {motion_ratio:.4f}"
+        
     def start(self):
         """Start service with reliability features"""
         logger.info("Starting runtime service...")
@@ -1815,10 +2309,8 @@ class RuntimeService:
         
         # Start camera threads
         for camera_name in self.cameras:
-            thread = threading.Thread(target=self.run_camera_thread, args=(camera_name,))
-            thread.daemon = True
-            thread.start()
-            self.threads.append(thread)
+            gen = int(self._camera_generation.get(camera_name, 0))
+            self._spawn_camera_worker(camera_name, gen)
         
         # Start event submission thread
         counting_thread = threading.Thread(target=self._global_counting_loop)
@@ -1889,7 +2381,7 @@ class RuntimeService:
                 filtered = []
                 for d in dets:
                     ts = float(d.get("ts", 0.0))
-                    if ts <= 0 or (now - ts) > self.customer_active_ttl_sec:
+                    if ts <= 0 or (now - ts) > self.dashboard_presence_ttl_sec:
                         continue
                     filtered.append({
                         "pid": int(d.get("pid", 0)),
@@ -1911,6 +2403,16 @@ class RuntimeService:
         same_person_multi_cam = {
             str(gid): cams for gid, cams in gid_to_cams.items() if len(cams) > 1
         }
+        motion_state = {
+            cam: {
+                "last_ratio": float(self._motion_last_ratio.get(cam, 0.0)),
+                "last_mean_diff": float(self._motion_last_mean_diff.get(cam, 0.0)),
+                "last_infer_ago_sec": max(0.0, now - float(self._motion_last_infer_ts.get(cam, 0.0)))
+                if self._motion_last_infer_ts.get(cam, 0.0) > 0
+                else -1.0,
+            }
+            for cam in self.cameras.keys()
+        }
         
         # Prefer the computed global live_customers but fall back to per-camera
         # counts when the global counter is zero. This avoids brief resets to
@@ -1927,6 +2429,7 @@ class RuntimeService:
             "camera_people": camera_people,
             "camera_gids": camera_gids,
             "same_person_multi_cam": same_person_multi_cam,
+            "motion": motion_state,
             "latest_customers": latest_customers,
             "realtime_counts": self.realtime_counts,
             "recent_snapshots": self.recent_snapshots[-50:],
@@ -1935,9 +2438,26 @@ class RuntimeService:
                 "yolo_iou": self.yolo_iou,
                 "yolo_imgsz": self.yolo_imgsz,
                 "yolo_mode": self.yolo_mode,
+                "person_class_id": self.person_class_id,
+                "head_class_id": self.head_class_id,
+                "staff_uniform_class_id": self.staff_uniform_class_id,
+                "yolo_detect_class_ids": self.yolo_detect_class_ids,
+                "inference_mode": self.inference_mode,
+                "enable_staff_uniform": self.enable_staff_uniform,
+                "staff_uniform_iou_threshold": self.staff_uniform_iou_threshold,
+                "motion_diff_threshold": self.motion_diff_threshold,
+                "motion_min_area_ratio": self.motion_min_area_ratio,
+                "motion_recheck_sec": self.motion_recheck_sec,
+                "motion_hold_sec": self.motion_hold_sec,
+                "motion_downscale_width": self.motion_downscale_width,
                 "sit_min_sec": self.sit_min_sec,
                 "vacant_grace_sec": self.vacant_grace_sec,
+                "camera_stall_timeout_sec": self.camera_stall_timeout_sec,
+                "camera_freeze_max_same_frames": self.camera_freeze_max_same_frames,
+                "camera_freeze_diff_threshold": self.camera_freeze_diff_threshold,
                 "customer_active_ttl_sec": self.customer_active_ttl_sec,
+                "dashboard_presence_ttl_sec": self.dashboard_presence_ttl_sec,
+                "no_detection_hold_sec": self.no_detection_hold_sec,
                 "resource_max_memory_percent": self.resource_guard.max_memory_percent,
                 "zone_point_mode": self.zone_point_mode,
                 "reid_similarity_threshold": self.reid_similarity_threshold,
@@ -1950,7 +2470,7 @@ class RuntimeService:
                 "exclude_staff_from_counts": self.exclude_staff_from_counts,
             },
             "summary": {
-                "active_people": self.live_customers,
+                "active_people": active_tracks_val,
                 "haircuts": self.haircut_counter.total_count,
                 "washes": self.wash_counter.total_count,
                 "waits": self.wait_realtime,
@@ -1993,18 +2513,41 @@ class RuntimeService:
         
         while self.running:
             try:
-                for camera_name, cam_stream in self.cameras.items():
-                    # Skip if currently processing
-                    if cam_stream.is_connected:
-                        continue
+                with self._camera_lock:
+                    camera_items = list(self.cameras.items())
+                for camera_name, cam_stream in camera_items:
+                    # Detect stalled camera loop even when stream still reports connected.
+                    last_ok = float(self._last_frame_ok_ts.get(camera_name, 0.0))
+                    camera_connected = bool(cam_stream.is_connected)
+                    if camera_connected and last_ok > 0.0:
+                        idle_sec = time.time() - last_ok
+                        if idle_sec >= self.camera_stall_timeout_sec:
+                            logger.warning(
+                                f"Watchdog: {camera_name} frame stalled for {idle_sec:.1f}s, marking degraded and scheduling reconnect"
+                            )
+                            cam_stream.is_connected = False
+                            cam_stream.reconnect_requested = True
+                            self.watchdog.mark_frame_failed(
+                                camera_name, f"Frame stall > {self.camera_stall_timeout_sec:.1f}s"
+                            )
+                            # If camera thread is blocked inside cap.read(), it may
+                            # never reach reconnect branch. Force-close capture from
+                            # watchdog side to break the blocking read.
+                            now_ts = time.time()
+                            last_force = float(self._last_forced_recover_ts.get(camera_name, 0.0))
+                            backoff_until = float(self._restart_backoff_until.get(camera_name, 0.0))
+                            if now_ts < backoff_until:
+                                continue
+                            if (now_ts - last_force) >= 10.0:
+                                self._last_forced_recover_ts[camera_name] = now_ts
+                                try:
+                                    logger.warning(f"Watchdog: forcing stream reset for {camera_name} to unblock reader")
+                                    self._restart_camera_worker(camera_name, reason="stall_recovery")
+                                except Exception as e:
+                                    logger.error(f"Watchdog: force-reset failed for {camera_name}: {e}")
                     
-                    # Check if should attempt reconnect
-                    if self.watchdog.should_attempt_reconnect(camera_name):
-                        # Attempt reconnection
-                        def reconnect_fn():
-                            return cam_stream.test_connection()
-                        
-                        self.watchdog.attempt_reconnect(camera_name, reconnect_fn)
+                    # Reconnect is handled in camera thread to avoid cross-thread
+                    # VideoCapture release/read races on OpenCV/FFmpeg.
                 
                 time.sleep(5)  # Check every 5 seconds
             

@@ -2,6 +2,13 @@
 
 This repository contains the HG Camera Counter application (runtime + controller).
 
+System Requirements
+-------------------
+- **FFmpeg**: Required for video recording.
+    - macOS: `brew install ffmpeg`
+    - Windows: Download from ffmpeg.org and add to PATH.
+    - Linux: `sudo apt install ffmpeg`
+
 Quick setup
 
 1. Install Python dependencies:

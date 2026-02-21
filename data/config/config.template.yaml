@@ -45,7 +45,14 @@ yolo:
   conf: 0.35             # Confidence threshold (0.0-1.0)
   iou: 0.5               # IOU threshold for NMS
   imgsz: 640             # Input image size
+  mode: "track"          # track | predict
   device: "auto"         # auto, cpu, mps, cuda
+  # Custom classes for salon use-case
+  # 0: person, 1: head_customer, 2: staff_uniform
+  detect_class_ids: [0, 1, 2]
+  person_class_id: 0
+  head_class_id: 1
+  staff_uniform_class_id: 2
 
 # Runtime Service Configuration
 runtime:
@@ -54,6 +61,25 @@ runtime:
   queue_size: 100             # Internal frame queue size
   heartbeat_interval: 30      # Seconds between heartbeat updates
   reconnect_interval: 5       # Seconds to wait before reconnecting to failed RTSP
+  customer_active_ttl_sec: 10.0      # Counting loop active-window (seconds)
+  dashboard_presence_ttl_sec: 25.0   # Dashboard hold to avoid flicker-to-zero
+  no_detection_hold_sec: 45.0        # Keep last detection briefly when detector drops
+  camera_stall_timeout_sec: 60.0     # Reconnect if no new frame arrives for this many seconds
+  camera_freeze_max_same_frames: 120 # Reconnect if stream repeats near-identical frames too long
+  camera_freeze_diff_threshold: 1.2  # Lower = stricter freeze detection
+  inference_mode: "always"           # always | motion_gated
+  motion_diff_threshold: 8.0         # Pixel-diff threshold (gray)
+  motion_min_area_ratio: 0.003       # Min changed-pixel ratio to trigger infer
+  motion_recheck_sec: 2.0            # Periodic infer even without motion
+  motion_hold_sec: 5.0               # Keep inferring briefly after motion
+  motion_downscale_width: 320        # Motion compute resize width
+  enable_staff_uniform: true         # If true, classify staff by uniform class instead of ReID
+  staff_uniform_iou_threshold: 0.20  # IoU(person/head, staff_uniform) to tag as staff
+  rtsp_prefer_tcp: true              # true = try ffmpeg_tcp first, false = try default/ffmpeg first
+  rtsp_force_ffmpeg: true            # true = only use ffmpeg backends (skip default backend)
+  sit_min_sec: 10.0                  # Seconds to confirm chair/wash event
+  vacant_grace_sec: 6.0              # Grace before zone considered empty
+  zone_point_mode: "foot"            # foot | center
 
 # Zone Dwell Time Thresholds (seconds)
 # Used to determine when person transitions from one event to another
