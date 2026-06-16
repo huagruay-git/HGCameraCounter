@@ -12,6 +12,16 @@ supabase:
   url: "${SUPABASE_URL:}"           # Or set SUPABASE_URL env var
   key: "${SUPABASE_ANON_KEY:}"      # Or set SUPABASE_ANON_KEY env var
 
+# OTA software update (app code). Optional.
+# "Check Updates" fetches metadata_url, compares it to `version` above, and only
+# offers an update when the remote version is newer. "Install Update" applies a
+# CODE-ONLY update (venv/data/models/config are preserved and the replaced code is
+# backed up under download_dir/backup), then restarts the controller.
+updates:
+  metadata_url: ""         # HTTPS URL to release metadata JSON (see shared/updater.py docstring)
+  download_dir: "updates"  # where staged downloads + backups are kept
+  auto_install: false      # manual install only (recommended)
+
 # Camera Configuration
 # Format:
 #   CameraName:
