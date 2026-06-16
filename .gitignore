@@ -50,6 +50,7 @@ data/yolo_role_dataset/
 data/performance_feedback/
 data/ai_knowledge/
 data/staff_gallery/
+/staff_gallery/
 data/yolo_head_dataset/images/
 data/yolo_head_dataset/labels/
 data/yolo_salon_dataset/images/
