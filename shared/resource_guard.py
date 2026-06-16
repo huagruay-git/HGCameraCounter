@@ -51,10 +51,20 @@ class ResourceGuard:
         
         # Process info
         self.process = psutil.Process()
+        # Prime CPU sampler to make subsequent non-blocking cpu_percent() useful.
+        try:
+            self.process.cpu_percent(interval=None)
+        except Exception:
+            pass
         
         # Running state
         self.running = False
         self.check_thread: Optional[threading.Thread] = None
+
+        # Cached metrics (updated by monitor loop and on-demand reads)
+        self.metrics_lock = threading.Lock()
+        self.last_metrics: Optional[ResourceMetrics] = None
+        self.last_metrics_ts: float = 0.0
         
         # Alerts
         self.high_memory_alert = False
@@ -97,19 +107,28 @@ class ResourceGuard:
             return fps
     
     def get_metrics(self) -> ResourceMetrics:
-        """Get current resource metrics"""
-        # Get memory info
+        """Get current resource metrics (non-blocking CPU sample + safe FPS snapshot)."""
+        # Get memory/cpu info from process
         mem_info = self.process.memory_info()
         mem_percent = self.process.memory_percent()
-        cpu_percent = self.process.cpu_percent(interval=0.1)
-        
-        # Calculate average FPS across cameras
+        cpu_percent = self.process.cpu_percent(interval=None)
+
+        # Snapshot frame/queue data without nested lock recursion
         with self.lock:
-            fps_values = [self.get_fps(cam) for cam in self.frame_times.keys()]
-            avg_fps = sum(fps_values) / len(fps_values) if fps_values else 0.0
+            frame_snapshot = {cam: list(times) for cam, times in self.frame_times.items()}
             queues = dict(self.queue_sizes)
-        
-        return ResourceMetrics(
+
+        fps_values = []
+        for frames in frame_snapshot.values():
+            if len(frames) < 2:
+                continue
+            time_span = frames[-1] - frames[0]
+            if time_span < 0.1:
+                continue
+            fps_values.append(len(frames) / max(time_span, 1e-6))
+        avg_fps = sum(fps_values) / len(fps_values) if fps_values else 0.0
+
+        metrics = ResourceMetrics(
             fps=avg_fps,
             cpu_percent=cpu_percent,
             memory_percent=mem_percent,
@@ -117,6 +136,18 @@ class ResourceGuard:
             queue_sizes=queues,
             timestamp=datetime.now()
         )
+        with self.metrics_lock:
+            self.last_metrics = metrics
+            self.last_metrics_ts = time.time()
+        return metrics
+
+    def get_latest_metrics(self, max_age_sec: float = 2.0) -> ResourceMetrics:
+        """Return cached metrics when fresh, otherwise sample new metrics."""
+        now_ts = time.time()
+        with self.metrics_lock:
+            if self.last_metrics is not None and (now_ts - self.last_metrics_ts) <= max(0.0, float(max_age_sec)):
+                return self.last_metrics
+        return self.get_metrics()
     
     def check_fps_limit(self, camera_name: str) -> bool:
         """Check if FPS is within limit"""
@@ -211,7 +242,7 @@ class ResourceGuard:
     def get_throttle_reason(self) -> Optional[str]:
         """Get reason for throttling if applicable"""
         if not self.check_memory_limit():
-            return f"Memory high: {self.get_metrics().memory_percent:.1f}%"
+            return f"Memory high: {self.get_latest_metrics(max_age_sec=2.0).memory_percent:.1f}%"
         if not self.check_queue_sizes():
             return "Queue size exceeded"
         return None

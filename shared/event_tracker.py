@@ -24,6 +24,7 @@ class EventType(Enum):
     WASH = "wash"
     WAIT = "wait"
     EXIT = "exit"
+    VERIFIED = "verified"
 
 
 @dataclass
@@ -229,7 +230,26 @@ class EventTracker:
         
         for person_id in to_remove:
             del self.sessions[person_id]
-    
+
+    def record_event(self, event: Event):
+        """Record an externally generated event (for async verification, etc.)."""
+        with self.lock:
+            session = self.sessions.get(event.person_id)
+            if session is None:
+                session = PersonSession(event.person_id, event.camera)
+                self.sessions[event.person_id] = session
+
+            session.camera = event.camera
+            session.last_seen = event.timestamp
+            session.events.append(event)
+
+            if event.event_type == EventType.CHAIR:
+                session.haircut_count += 1
+            elif event.event_type == EventType.WASH:
+                session.wash_count += 1
+            elif event.event_type == EventType.WAIT:
+                session.wait_count += 1
+
     def get_events(self, flush: bool = False) -> List[Event]:
         """Get all events"""
         with self.lock:
