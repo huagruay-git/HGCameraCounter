@@ -7,9 +7,9 @@ from datetime import datetime
 
 # --- Configuration: รายชื่อกล้อง ---
 CAMERAS = {
-    "Camera_01": "rtsp://admin:112113114@192.168.1.24:554/ch01/0",
-    "Camera_02": "rtsp://admin:112113114@192.168.1.83:554/ch01/0",
-    "Camera_03": "rtsp://admin:112113114@192.168.1.91:554/ch01/0",
+    "Camera_01": "rtsp://<user>:<pass>@192.168.1.24:554/ch01/0",
+    "Camera_02": "rtsp://<user>:<pass>@192.168.1.83:554/ch01/0",
+    "Camera_03": "rtsp://<user>:<pass>@192.168.1.91:554/ch01/0",
 }
 
 # ----------------------------

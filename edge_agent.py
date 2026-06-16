@@ -38,9 +38,9 @@ import torchvision.models as models
 # CONFIG
 # =========================
 CAMERAS_CONFIG = {
-    "Camera_01": os.getenv("CAM1_URL", "rtsp://admin:112113114@192.168.1.24:554/ch01/0"),
-    "Camera_02": os.getenv("CAM2_URL", "rtsp://admin:112113114@192.168.1.83:554/ch01/0"),
-    "Camera_03": os.getenv("CAM3_URL", "rtsp://admin:112113114@192.168.1.91:554/ch01/0"),
+    "Camera_01": os.getenv("CAM1_URL", "rtsp://<user>:<pass>@192.168.1.24:554/ch01/0"),
+    "Camera_02": os.getenv("CAM2_URL", "rtsp://<user>:<pass>@192.168.1.83:554/ch01/0"),
+    "Camera_03": os.getenv("CAM3_URL", "rtsp://<user>:<pass>@192.168.1.91:554/ch01/0"),
 }
 
 USE_VIDEO = os.getenv("USE_VIDEO", "0") == "1"

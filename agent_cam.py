@@ -14,8 +14,8 @@ import torch
 # CONFIG
 # =========================
 CAMERAS_CONFIG = {
-    "Camera_01": os.getenv("CAM1_URL", "rtsp://admin:112113114@192.168.1.24:554/ch01/0"),
-    "Camera_02": os.getenv("CAM2_URL", "rtsp://admin:112113114@192.168.1.83:554/ch01/0"),
+    "Camera_01": os.getenv("CAM1_URL", "rtsp://<user>:<pass>@192.168.1.24:554/ch01/0"),
+    "Camera_02": os.getenv("CAM2_URL", "rtsp://<user>:<pass>@192.168.1.83:554/ch01/0"),
     "Camera_03": os.getenv("CAM3_URL", ""),  # ว่างได้ ถ้าไม่ใช้
 }
 

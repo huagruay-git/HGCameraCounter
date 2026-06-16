@@ -14,10 +14,10 @@ Edit `data/config/config.yaml`:
 ```yaml
 cameras:
   Camera_01:
-    rtsp_url: "rtsp://admin:112113114@192.168.1.24:554/ch01/0"
+    rtsp_url: "rtsp://<user>:<pass>@192.168.1.24:554/ch01/0"
     enabled: true
   Camera_02:
-    rtsp_url: "rtsp://admin:112113114@192.168.1.83:554/ch01/0"
+    rtsp_url: "rtsp://<user>:<pass>@192.168.1.83:554/ch01/0"
     enabled: true
 ```
 

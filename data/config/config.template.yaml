@@ -22,13 +22,13 @@ supabase:
 
 cameras:
   Camera_01:
-    rtsp_url: "rtsp://admin:112113114@192.168.1.24:554/ch01/0"
+    rtsp_url: "rtsp://<user>:<pass>@<camera-01-host>:554/ch01/0"
     enabled: true
     zones_file: "data/zones/zones_Camera_01.json"
     note: "Main shop view"
   
   Camera_02:
-    rtsp_url: "rtsp://admin:112113114@192.168.1.83:554/ch01/0"
+    rtsp_url: "rtsp://<user>:<pass>@<camera-02-host>:554/ch01/0"
     enabled: true
     zones_file: "data/zones/zones_Camera_02.json"
     note: "Wash area"
