@@ -1,0 +1,49 @@
+model:
+  model_path: "models/best.pt"
+  tracker_mode: "bytetrack" # bytetrack | deepsort
+  tracker_cfg: "bytetrack.yaml"
+  deepsort_max_age: 30
+  deepsort_n_init: 3
+  deepsort_max_iou_distance: 0.7
+  deepsort_nn_budget: 100
+  imgsz: 960
+  iou: 0.5
+  base_conf: 0.25
+  device: "auto"
+  class_names:
+    - "customer_haircut"
+    - "staff_barber"
+    - "customer_wash"
+  class_thresholds:
+    customer_haircut: 0.45
+    staff_barber: 0.50
+    customer_wash: 0.40
+
+runtime:
+  target_fps: 8
+  reconnect_sec: 2
+  track_ttl_sec: 25
+  zone_memory_sec: 8
+  wash_return_window_sec: 3600
+  wash_recount_cooldown_sec: 600
+  haircut_recount_cooldown_sec: 7200
+  staff_lock_sec: 1200
+  reid_similarity_threshold: 0.86
+  reid_ttl_sec: 3600
+  smoothing_window: 12
+  smoothing_min_votes: 4
+  hard_negative_enabled: true
+  hard_negative_dir: "data/performance_feedback/hard_negative"
+
+cameras:
+  Camera_01:
+    enabled: true
+    rtsp_url: "rtsp://user:pass@192.168.1.202:554/stream1"
+    zones:
+      chair_1: [[120, 220], [520, 220], [560, 650], [100, 650]]
+      wash_1: [[600, 220], [950, 220], [980, 660], [580, 660]]
+      wait_1: [[30, 200], [110, 200], [110, 650], [30, 650]]
+  Camera_02:
+    enabled: false
+    rtsp_url: "rtsp://user:pass@192.168.1.203:554/stream1"
+    zones: {}

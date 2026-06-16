@@ -1,0 +1,7 @@
+path: "data/yolo_salon_dataset"
+train: "images/train"
+val: "images/val"
+names:
+  0: "customer_haircut"
+  1: "staff_barber"
+  2: "customer_wash"

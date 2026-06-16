@@ -41,7 +41,10 @@ cameras:
 
 # YOLO Detection Configuration
 yolo:
-  model: "yolov8m.pt"    # yolov8n.pt (smaller), yolov8m.pt (medium), yolov8l.pt (large)
+  model: "best.pt"       # Legacy/default worker model alias
+  discovery_model: "yolov8n.pt"  # Tier-1 discovery model (generic COCO person detector)
+  worker_model: "best.pt"        # Tier-2 high-precision verification model
+  auto_switch_discovery_on_schema_mismatch: false  # true = force discovery->worker when class schema mismatches
   conf: 0.35             # Confidence threshold (0.0-1.0)
   iou: 0.5               # IOU threshold for NMS
   imgsz: 640             # Input image size
@@ -49,7 +52,7 @@ yolo:
   device: "auto"         # auto, cpu, mps, cuda
   # Custom classes for salon use-case
   # 0: person, 1: head_customer, 2: staff_uniform
-  detect_class_ids: [0, 1, 2]
+  detect_class_ids: [0]
   person_class_id: 0
   head_class_id: 1
   staff_uniform_class_id: 2
@@ -57,6 +60,10 @@ yolo:
 # Runtime Service Configuration
 runtime:
   target_fps: 10              # Target frames per second per camera
+  dashboard_ui_frame_interval_sec: 0.20   # Min interval for dashboard frame copy (lower = smoother, higher = lighter CPU/RAM)
+  dashboard_state_min_interval_sec: 1.00  # Min interval for writing runtime/dashboard_state.json
+  gc_collect_interval_sec: 60.0           # Garbage collection interval (seconds)
+  summary_log_interval_sec: 30.0          # Min interval for summary info logs
   max_workers: 4              # Max number of camera threads
   queue_size: 100             # Internal frame queue size
   heartbeat_interval: 30      # Seconds between heartbeat updates
@@ -67,19 +74,100 @@ runtime:
   camera_stall_timeout_sec: 60.0     # Reconnect if no new frame arrives for this many seconds
   camera_freeze_max_same_frames: 120 # Reconnect if stream repeats near-identical frames too long
   camera_freeze_diff_threshold: 1.2  # Lower = stricter freeze detection
+  performance_preset: "balanced"     # eco | balanced | max_accuracy
   inference_mode: "always"           # always | motion_gated
+  auto_motion_gate_enabled: true     # Auto switch always->motion_gated on high CPU/MEM
+  auto_motion_gate_cpu_threshold: 85.0   # CPU % threshold for auto motion-gated
+  auto_motion_gate_mem_threshold: 88.0   # Memory % threshold for auto motion-gated
+  auto_motion_gate_recover_sec: 20.0     # Stable normal duration before switching back to always
+  auto_motion_gate_min_hold_sec: 15.0    # Minimum hold time while auto motion-gated is active
   motion_diff_threshold: 8.0         # Pixel-diff threshold (gray)
   motion_min_area_ratio: 0.003       # Min changed-pixel ratio to trigger infer
   motion_recheck_sec: 2.0            # Periodic infer even without motion
   motion_hold_sec: 5.0               # Keep inferring briefly after motion
   motion_downscale_width: 320        # Motion compute resize width
-  enable_staff_uniform: true         # If true, classify staff by uniform class instead of ReID
+  enable_staff_uniform: false        # false = use staff gallery ReID for staff filtering
   staff_uniform_iou_threshold: 0.20  # IoU(person/head, staff_uniform) to tag as staff
+  enable_role_snapshots: true        # Save role-labeled crops for admin review/training
+  role_snapshot_cooldown_sec: 20.0   # Minimum seconds before saving same role+person again
+  role_snapshot_customer_interval_sec: 600.0  # Min interval for customer snapshots per zone-cell
+  role_snapshot_barber_interval_sec: 300.0    # Min interval for barber snapshots per zone-cell
+  role_snapshot_wash_interval_sec: 300.0      # Min interval for wash-customer snapshots per zone-cell
+  role_snapshot_unknown_interval_sec: 180.0   # Min interval for unresolved-role snapshots per zone-cell
+  role_snapshot_enable_unknown: true          # false = do not save unresolved-role snapshots to unknown_by_admin
+  role_snapshot_thumb_min_diff: 8.0           # Higher = stricter duplicate-image suppression
+  role_snapshot_min_conf: 0.45                # Ignore very low-confidence detections
+  role_snapshot_min_area_ratio: 0.01          # Ignore tiny person boxes
+  role_snapshot_require_customer_chair_zone: true  # Save customer snapshots only when in CHAIR zone
+  role_snapshot_customer_max_per_camera_day: 120   # Hard cap per camera/day
+  role_snapshot_barber_max_per_camera_day: 80      # Hard cap per camera/day
+  role_snapshot_wash_max_per_camera_day: 80        # Hard cap wash_customer per camera/day
+  role_snapshot_unknown_max_per_camera_day: 120    # Hard cap unresolved snapshots per camera/day (set 0 to disable)
   rtsp_prefer_tcp: true              # true = try ffmpeg_tcp first, false = try default/ffmpeg first
   rtsp_force_ffmpeg: true            # true = only use ffmpeg backends (skip default backend)
+  recorder_enable_person_zone_gate: true   # true = detect person-in-zone before recording
+  recorder_probe_interval_sec: 1.0         # Probe interval for person-in-zone gate
+  recorder_clip_duration_sec: 5.0          # Short clip length when trigger is active
+  recorder_trigger_cooldown_sec: 8.0       # Min seconds between clips per camera
+  recorder_same_person_dist_norm: 0.08     # Same-person distance threshold (normalized)
+  recorder_same_person_memory_sec: 180.0   # How long to treat identity as same person
+  recorder_required_stable_hits: 2         # Need N consecutive hits before trigger (unless same-person fast-pass)
+  recorder_person_conf: 0.30               # YOLO confidence for recorder probe
+  recorder_person_iou: 0.45                # YOLO IoU for recorder probe
+  recorder_person_imgsz: 384               # YOLO image size for recorder probe
+  processor_skip_backlog_on_start: true    # Skip old backlog on startup (prevents endless previous-day processing)
+  processor_only_today: true               # Process recordings from current date only
+  processor_max_recording_age_sec: 86400.0 # Drop/move stale recordings older than this age
+  processor_quick_skip_no_person: true     # Fast pre-check and delete clips with no person in business zones
+  processor_quick_check_frames: 18         # Number of sampled frames for quick pre-check
+  processor_quick_check_stride: 12         # Read every Nth frame in quick pre-check
+  processor_frame_sleep_sec: 0.03          # Lower = faster recorded processing with less wall-clock delay
+  tier2_clip_duration_sec: 4.0       # Post-trigger clip duration sent to Tier-2 worker
   sit_min_sec: 10.0                  # Seconds to confirm chair/wash event
   vacant_grace_sec: 6.0              # Grace before zone considered empty
+  service_vacant_grace_sec: 6.0      # Grace used by haircut/wash counters between customers
+  # Haircut counting allowlist (camera -> allowed CHAIR zones)
+  # IMPORTANT: If empty or missing, haircut event counting is disabled.
+  # Supports wildcard zone pattern like "CHAIR_*"
+  # haircut_count_zones:
+  #   Camera_192_168_1_132: ["CHAIR_01"]
+  #   Camera_192_168_1_136: ["CHAIR_02"]
+  #   Camera_192_168_1_135: ["CHAIR_03"]
+  # Optional chair-only classifier to confirm haircut before count.
+  enable_chair_service_classifier: false
+  chair_service_classifier_model: "models/chair_service_cls.pt"
+  chair_service_classifier_positive_labels: ["haircut"]  # labels treated as "haircut=true"
+  chair_service_classifier_min_conf: 0.55
+  chair_service_classifier_imgsz: 224
+  enable_business_hours_guard: false # If true, block counting/Tier-2 outside opening hours below
+  business_hours_start: "09:00"      # HH:MM local time
+  business_hours_end: "22:00"        # HH:MM local time
+  restore_dashboard_state_on_startup: false # If true, resume counters from runtime/dashboard_state.json on service start
+  restore_dashboard_state_max_age_sec: 900.0 # Restore only if state age <= this many seconds
+  enable_event_reid_dedupe: true     # Run ReID only when a haircut event is about to be counted
+  haircut_event_dedupe_window_sec: 900.0  # Suppress duplicate same-customer haircut events across cameras
+  haircut_event_dedupe_similarity: 0.82   # ReID similarity threshold for duplicate haircut suppression
+  event_snapshot_fallback_to_event_bbox: true  # Save snapshot even if live match disappeared, using event bbox
   zone_point_mode: "foot"            # foot | center
+  enable_reid: true                  # Enable live ReID for cross-camera global ID dedupe
+  staff_event_similarity_threshold: 0.72  # Event-stage staff rejection threshold (snapshot/count guard)
+  enable_role_db_reid: true          # Use role_db.json embedding classifier in runtime (barber/customer)
+  role_db_barber_threshold: 0.78     # Cosine threshold to classify barber_uniform from role_db
+  role_db_customer_threshold: 0.76   # Cosine threshold to classify customer from role_db
+  role_db_customer_margin: 0.04      # Customer must beat barber score by this margin to override
+  role_db_customer_override_staff: true  # If true, strong customer role clears staff flag
+  role_db_max_embeddings_per_role: 512   # Cap role_db vectors per role in memory for speed
+  role_vote_window: 15               # Temporal role voting window (frames)
+  role_vote_min_samples: 5           # Minimum votes before role considered stable
+  role_vote_min_ratio: 0.60          # Minimum majority ratio to accept stable role
+  role_unknown_min_conf: 0.35        # Lower than this => frame vote forced to unknown
+  require_stable_customer_role_for_service: false # Safer default: do not block counting when role is still unknown
+  service_session_timeout_sec: 600.0 # Close inactive PID service session after this timeout
+  reid_max_prototypes_per_pid: 5     # Keep N embedding prototypes per PID (reduces drift)
+  fsm_enabled: true                  # Use service FSM as primary counting engine
+  fsm_return_dwell_sec: 3.0          # Dwell in chair after wash to mark returned state
+  fsm_close_timeout_sec: 600.0       # Inactive timeout before transition to closed
+  fsm_return_window_sec: 1200.0      # Maximum time after wash to classify as returned
 
 # Zone Dwell Time Thresholds (seconds)
 # Used to determine when person transitions from one event to another
@@ -90,7 +178,7 @@ dwell_time:
 
 # Staff Detection Configuration
 staff:
-  enable_reid: false          # Enable re-identification (requires more GPU/CPU)
+  enable_reid: true           # Enable staff gallery matching from uniform photos
   dwell_threshold: 12         # Seconds in staff zone to tag as staff
   gallery_dir: "data/staff_gallery"  # Staff photos directory
 
@@ -101,6 +189,12 @@ paths:
   zones: "data/zones"                        # Zone JSON files
   staff_gallery: "data/staff_gallery"        # Staff gallery photos
   staff_db: "data/staff_gallery/staff_db.json"  # Generated staff database
+  role_db: "data/staff_gallery/barber_customer_db.json"  # Admin-verified barber/customer knowledge JSON
+  performance_feedback: "data/performance_feedback"  # QA folders: haircut/customerwash/no haircut/no customerwash
+  customer_by_admin: "data/customer_by_admin"   # Admin-confirmed customer snapshots
+  customer_wash_by_admin: "data/customer_wash_by_admin"  # Optional wash-customer knowledge snapshots
+  unknown_by_admin: "data/unknown_by_admin"     # Unresolved role snapshots for manual review
+  runtime_settings_override: "runtime/runtime_settings.override.json"  # Runtime hot-apply control file
   reports: "reports"                         # CSV reports output
   snapshots: "snapshots"                     # Frame captures
   logs: "logs"                               # Application logs
