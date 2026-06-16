@@ -73,7 +73,7 @@ GLOBAL_MATCH_MAX_SEC = float(os.getenv("GLOBAL_MATCH_MAX_SEC", "2.0"))
 GLOBAL_MATCH_MAX_DIST = float(os.getenv("GLOBAL_MATCH_MAX_DIST", "0.12"))
 
 # count when dwell >= N sec
-SIT_MIN_SEC = float(os.getenv("SIT_MIN_SEC", "10"))
+SIT_MIN_SEC = float(os.getenv("SIT_MIN_SEC", "180")) # 3 minutes default
 
 # end zone session if not seen > grace sec
 VACANT_GRACE_SEC = float(os.getenv("VACANT_GRACE_SEC", "6"))
@@ -837,7 +837,7 @@ class ZoneSessionCounter:
     def sync_active_pids(self, active_pids: Set[int]):
         self.counted_active_pid = {pid for pid in self.counted_active_pid if pid in active_pids}
 
-    def update_and_collect_events(self, customers: List[dict], zone_selector_fn) -> List[dict]:
+    def update_and_collect_events(self, customers: List[dict], zone_selector_fn, wait_tracker: Dict[int, float] = None) -> List[dict]:
         self._ensure_day()
         now = time.time()
         events = []
@@ -889,6 +889,11 @@ class ZoneSessionCounter:
                     st["counted"] = True
                     continue
 
+                # Calculate Wait Time if this is HAIRCUT and we have a start time
+                wait_duration = 0.0
+                if wait_tracker and pid in wait_tracker:
+                    wait_duration = st["enter_ts"] - wait_tracker[pid]
+
                 st["counted"] = True
                 self.counted_active_pid.add(pid)
                 self.last_count_by_zone_pid[(zone, pid)] = now
@@ -906,6 +911,7 @@ class ZoneSessionCounter:
                     "pid": pid,
                     "gid": gid,
                     "dwell": float(dwell),
+                    "wait_duration": float(wait_duration)
                 })
 
         for zone, st in list(self.state.items()):
@@ -1018,6 +1024,7 @@ def main():
 
     gid_mgr = GlobalIDManager()
     active_mem = ActivePersonMemory()
+    pid_wait_start = {} # pid -> ts
 
     def get_latest_frame(cam_name: str):
         if cam_name == "Camera_01":
@@ -1150,8 +1157,16 @@ def main():
 
             wait_pids = {d["pid"] for d in customers if is_wait(d)}
             wait_realtime = len(wait_pids)
+            
+            # --- Wait Tracker Logic ---
+            for pid in wait_pids:
+                if pid not in pid_wait_start:
+                    pid_wait_start[pid] = now
+            # Optional: remove expired PIDs from wait_tracker
+            dead_waits = [p for p in pid_wait_start if p not in active_pids]
+            for p in dead_waits: pid_wait_start.pop(p, None)
 
-            haircut_events = haircut_counter.update_and_collect_events(customers, select_haircut_zone)
+            haircut_events = haircut_counter.update_and_collect_events(customers, select_haircut_zone, wait_tracker=pid_wait_start)
             wash_events = wash_counter.update_and_collect_events(customers, select_wash_zone)
 
             if haircut_events or wash_events:

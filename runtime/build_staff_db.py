@@ -23,6 +23,13 @@ except Exception:
     torch = None
 
 try:
+    import torchvision.transforms as T
+    import torchvision.models as tv_models
+except Exception:
+    T = None
+    tv_models = None
+
+try:
     from ultralytics import YOLO
 except Exception:
     YOLO = None
@@ -42,7 +49,27 @@ logger = setup_logger("build_staff_db", CONFIG.get("paths", {}).get("logs", "log
 YOLO_CONFIG = CONFIG.get("yolo", {})
 PATHS_CONFIG = CONFIG.get("paths", {})
 
-YOLO_MODEL_PATH = os.path.join(PATHS_CONFIG.get("models", "models"), YOLO_CONFIG.get("model", "yolov8m.pt"))
+def _resolve_model_path(model_name: str) -> str:
+    raw = str(model_name or "").strip()
+    if not raw:
+        raw = "yolov8n.pt"
+    p = Path(raw)
+    if p.is_absolute():
+        return str(p)
+    # try project root
+    cand = (Path.cwd() / p).resolve()
+    if cand.exists():
+        return str(cand)
+    # try configured models directory
+    cand2 = (Path(PATHS_CONFIG.get("models", "models")) / p).resolve()
+    if cand2.exists():
+        return str(cand2)
+    # keep as plain model name for ultralytics download fallback
+    return raw
+
+YOLO_MODEL_PATH = _resolve_model_path(
+    YOLO_CONFIG.get("discovery_model", YOLO_CONFIG.get("model", "yolov8n.pt"))
+)
 STAFF_GALLERY_DIR = PATHS_CONFIG.get("staff_gallery", "data/staff_gallery")
 STAFF_DB_PATH = PATHS_CONFIG.get("staff_db", "data/staff_gallery/staff_db.json")
 CROPS_DIR = os.path.join(STAFF_GALLERY_DIR, "_crops")
@@ -98,10 +125,6 @@ def load_yolo_model():
     if YOLO is None:
         logger.error("ultralytics.YOLO is not installed")
         raise ImportError("ultralytics (YOLO) not available")
-
-    if not os.path.exists(YOLO_MODEL_PATH):
-        logger.error(f"YOLO model not found: {YOLO_MODEL_PATH}")
-        raise FileNotFoundError(f"YOLO model: {YOLO_MODEL_PATH}")
 
     logger.info(f"Loading YOLO model: {YOLO_MODEL_PATH}")
     model = YOLO(YOLO_MODEL_PATH)
@@ -159,9 +182,30 @@ def crop_person(bgr: np.ndarray, box_xyxy: Tuple[int, int, int, int], margin: fl
 # =========================
 
 class SimpleReIDExtractor:
-    """Simple embedding extractor using timm backbone"""
+    """Embedding extractor compatible with runtime ReID encoder."""
     
     def __init__(self, model_name: str = "resnet50", device: str = "cpu"):
+        self.device = device
+        self.backbone = None
+        self.tf = None
+        self.embed_dim = 2048
+
+        # Primary path: use torchvision ResNet50 with same preprocessing as runtime/agent_v2.py
+        if torch is not None and tv_models is not None and T is not None:
+            model = tv_models.resnet50(weights=tv_models.ResNet50_Weights.DEFAULT)
+            model.fc = torch.nn.Identity()
+            model.eval()
+            self.backbone = model.to(device)
+            self.tf = T.Compose([
+                T.ToPILImage(),
+                T.Resize((256, 128)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            logger.info("Loaded torchvision ReID model: resnet50 (runtime-compatible)")
+            return
+
+        # Fallback path: still works, but embeddings may be incompatible with runtime matching.
         try:
             import timm
             self.backbone = timm.create_model(
@@ -172,36 +216,37 @@ class SimpleReIDExtractor:
             )
             self.backbone = self.backbone.to(device)
             self.backbone.eval()
-            self.device = device
             self.embed_dim = 2048 if "resnet50" in model_name else 512
-            logger.info(f"Loaded timm model: {model_name}")
+            logger.warning(
+                "Falling back to timm embedding model; vectors may not match runtime ReID space."
+            )
         except ImportError:
-            logger.error("timm not installed, using random embeddings")
+            logger.error("No embedding backend available (torchvision/timm missing)")
             self.backbone = None
-            self.device = device
             self.embed_dim = 512
     
     def extract(self, bgr: np.ndarray) -> np.ndarray:
         """Extract embedding from image"""
         if self.backbone is None:
             return np.random.randn(self.embed_dim).astype(np.float32)
-        
-        # Preprocess
+
+        # Runtime-compatible path (torchvision)
+        if self.tf is not None and torch is not None:
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            x = self.tf(rgb).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                embedding = self.backbone(x).squeeze(0).detach().float().cpu().numpy()
+            return l2_normalize(embedding.astype(np.float32))
+
+        # Fallback path (timm)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         rgb = cv2.resize(rgb, (224, 224))
-        
-        # Normalize
         rgb_tensor = torch.from_numpy(rgb).float().permute(2, 0, 1) / 255.0
         rgb_tensor = rgb_tensor.unsqueeze(0).to(self.device)
-        
-        # Extract
         with torch.no_grad():
             embedding = self.backbone(rgb_tensor)
             embedding = embedding.squeeze(0).cpu().numpy()
-        
-        # Normalize
-        embedding = l2_normalize(embedding.astype(np.float32))
-        return embedding
+        return l2_normalize(embedding.astype(np.float32))
 
 
 # =========================
@@ -302,15 +347,12 @@ def build_staff_db(
                 box = detect_largest_person(yolo, bgr)
                 
                 if box is None:
-                    logger.warning(f"No person detected: {img_path}")
-                    report.failed_images.append({
-                        "image": img_path,
-                        "reason": "No person detected"
-                    })
-                    continue
-                
-                # Crop
-                crop = crop_person(bgr, box[:4])
+                    # Fallback for pre-cropped portrait/staff images where detector
+                    # may miss due too-tight framing.
+                    crop = bgr.copy()
+                else:
+                    # Crop
+                    crop = crop_person(bgr, box[:4])
                 
                 # Save crop if requested
                 if save_crops:

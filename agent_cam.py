@@ -848,37 +848,85 @@ class CustomerLogic:
                 if ok:
                     pf["counted"] = True
                     pf["confidence"] = conf
-                    self.total_customer_count += 1
-                    self.chair_total[chair_zone] = self.chair_total.get(chair_zone, 0) + 1
-                    self.seq += 1
-
-                    # snapshot
+                    
+                    # Pre-capture snapshot for verification
                     snapshot_path = ""
                     frame = get_latest_frame_func(st["last_cam"])
                     if frame is not None and st["last_bbox"] is not None:
                         ensure_dir(SNAPSHOT_DIR)
+                        # Use temp seq 0000 since seq is updated later
                         snapshot_path = os.path.join(
                             SNAPSHOT_DIR,
-                            f"{self.day}_seq{self.seq:04d}_{st['last_cam']}_{chair_zone}_pid{pid}.jpg"
+                            f"{self.day}_seq0000_{st['last_cam']}_{chair_zone}_pid{pid}.jpg"
                         )
                         p = crop_and_save_snapshot(frame, st["last_bbox"], snapshot_path, pad=SNAPSHOT_PAD)
                         snapshot_path = p or ""
-
-                    # csv
-                    self.csv.log_event(
-                        seq=self.seq,
-                        event="CUSTOMER_COUNT",
-                        cam=st["last_cam"] or "",
-                        zone=chair_zone,
-                        pid=int(pid),
-                        gid=int(pid),   # ให้ gid=pid เพื่ออ่านง่าย (คนเดียวกัน)
-                        local_vid=int(st["last_vid"] or 0),
-                        dwell_sec=float(dwell),
-                        confidence=float(conf),
-                        snapshot_path=snapshot_path
-                    )
-
-                    print(f"✅ COUNTED | day={self.day} seq={self.seq} chair={chair_zone} total={self.total_customer_count} pid={pid} dwell={dwell:.1f}s conf={conf:.2f} snap={bool(snapshot_path)}")
+                        
+                    print(f"⌛ VLM VERIFYING: {chair_zone} pid={pid}...")
+                    
+                    def verify_and_commit():
+                         is_customer = True
+                         if snapshot_path:
+                             try:
+                                 import urllib.request, json, base64
+                                 req_m = urllib.request.Request("http://127.0.0.1:11434/api/tags")
+                                 resp_m = urllib.request.urlopen(req_m, timeout=2)
+                                 md = json.loads(resp_m.read().decode())
+                                 models = [m["name"] for m in md.get("models", [])]
+                                 target = next((m for m in models if "llava" in m or "llama3" in m), models[0] if models else "")
+                                 if target:
+                                     with open(snapshot_path, "rb") as bf:
+                                         b64 = base64.b64encode(bf.read()).decode("utf-8")
+                                     payload = {
+                                         "model": target,
+                                         "prompt": "Is the person in this image a customer receiving a service (like a haircut)? Answer YES or NO.",
+                                         "stream": False,
+                                         "images": [b64]
+                                     }
+                                     req = urllib.request.Request("http://127.0.0.1:11434/api/generate", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                                     with urllib.request.urlopen(req, timeout=30) as response:
+                                         res = json.loads(response.read().decode())
+                                         ans = res.get("response", "").upper()
+                                         if "NO" in ans and "YES" not in ans:
+                                             is_customer = False
+                             except Exception as e:
+                                 print(f"⚠️ [Ollama Assist] Fallback to YES (Error/Timeout): {e}")
+                                 
+                         if is_customer:
+                            self.total_customer_count += 1
+                            self.chair_total[chair_zone] = self.chair_total.get(chair_zone, 0) + 1
+                            self.seq += 1
+                            
+                            # Rename snapshot to proper seq
+                            final_snap = ""
+                            if snapshot_path and os.path.exists(snapshot_path):
+                                final_snap = snapshot_path.replace("seq0000", f"seq{self.seq:04d}")
+                                try:
+                                    os.rename(snapshot_path, final_snap)
+                                except Exception:
+                                    final_snap = snapshot_path
+                            
+                            self.csv.log_event(
+                                seq=self.seq,
+                                event="CUSTOMER_COUNT",
+                                cam=st["last_cam"] or "",
+                                zone=chair_zone,
+                                pid=int(pid),
+                                gid=int(pid),
+                                local_vid=int(st["last_vid"] or 0),
+                                dwell_sec=float(dwell),
+                                confidence=float(conf),
+                                snapshot_path=final_snap
+                            )
+                            print(f"✅ AI CONFIRMED | COUNTED | day={self.day} seq={self.seq} chair={chair_zone} total={self.total_customer_count} pid={pid}")
+                         else:
+                            print(f"❌ AI REJECTED | NOT COUNTED | chair={chair_zone} pid={pid} (Fake/Staff detected by VLM)")
+                            if snapshot_path and os.path.exists(snapshot_path):
+                                try: os.remove(snapshot_path)
+                                except Exception: pass
+                    
+                    import threading
+                    threading.Thread(target=verify_and_commit, daemon=True).start()
                 else:
                     # ถ้า require wash และยังไม่ครบ -> ยังไม่นับ แต่จำ timestamp ไว้
                     print(f"⏳ CHAIR_OK_WAIT_WASH | chair={chair_zone} pid={pid} dwell={dwell:.1f}s require_wash={REQUIRE_WASH}")
