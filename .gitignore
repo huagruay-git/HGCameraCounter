@@ -66,6 +66,9 @@ temp_clips/
 data/recordings/
 runtime/processor_sync_state.json
 runtime/chair_service_autotrain_state.json
+runtime/dashboard_state.json
+runtime/dashboard_state*.tmp
+runtime/runtime_settings.override.json
 
 # ===== Third-party binaries =====
 tools/ffmpeg/
