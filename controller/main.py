@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QTextEdit, QSplitter, QSpinBox, QFileDialog,
     QListWidget, QListWidgetItem, QDoubleSpinBox, QComboBox, QLineEdit,
     QFormLayout, QGroupBox, QProgressBar, QTableWidget, QTableWidgetItem,
-    QCheckBox, QScrollArea,
+    QCheckBox, QScrollArea, QFrame, QGridLayout,
     QHeaderView
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize
@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from shared.config import Config
 from shared.logger import setup_logger
 from shared.dashboard_updater import init_dashboard_service, get_broadcaster
-from shared.updater import Updater
+from shared.updater import Updater, is_newer
 from controller.setup_wizard import SetupWizard
 from controller.dashboard_client import GUIDashboardClient
 from controller.camera_manager import CameraManagerWidget
@@ -50,6 +50,7 @@ from controller.zone_editor import ZoneEditorWidget
 from controller.staff_builder import StaffBuilderWidget
 from controller.live_viewer import LiveViewerWidget
 from controller.performance_widget import PerformanceWidget
+from controller.theme import apply_theme, SidebarTabWidget
 
 # =========================
 # SETUP
@@ -102,24 +103,24 @@ class CommandWorker(QObject):
                 models = [m["name"] for m in data.get("models", [])]
                 if models:
                     target = next((m for m in models if "llava" in m or "llama3" in m), models[0])
-                    self.status_ai_model.setText(f"AI: ๐ข {target}")
+                    self.status_ai_model.setText(f"AI: {target}")
                     self.status_ai_model.setStyleSheet("color: green; font-weight: bold;")
                 else:
-                    self.status_ai_model.setText("AI: ๐”ด No Models")
+                    self.status_ai_model.setText("AI: No Models")
                     self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
         except Exception:
-             self.status_ai_model.setText("AI: ๐”ด Offline (YOLO Only)")
+             self.status_ai_model.setText("AI: Offline (YOLO Only)")
              self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
 
     def tab_llm(self):
         from controller.llm_evaluation_ui import LLMEvaluationWidget
         self.llm_tab_widget = LLMEvaluationWidget()
-        self.tabs.addTab(self.llm_tab_widget, "๐ค– AI Evaluation")
+        self.tabs.addTab(self.llm_tab_widget, "AI Evaluation")
         
     def tab_cloud_sync(self):
         from controller.cloud_sync_widget import CloudSyncWidget
         self.cloud_sync_widget = CloudSyncWidget(self.config_manager)
-        self.tabs.addTab(self.cloud_sync_widget, "โ๏ธ Cloud Sync")
+        self.tabs.addTab(self.cloud_sync_widget, "Cloud Sync")
 
 # =========================
 # MAIN CONTROLLER
@@ -216,24 +217,24 @@ class MainController(QMainWindow):
         header_layout.addStretch()
         
         # Start/Stop button
-        self.start_btn = QPushButton("โ–ถ Start Service")
+        self.start_btn = QPushButton("Start Service")
         self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;")
         self.start_btn.clicked.connect(self.start_service)
         header_layout.addWidget(self.start_btn)
         
-        self.stop_btn = QPushButton("โน Stop Service")
+        self.stop_btn = QPushButton("Stop Service")
         self.stop_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 5px;")
         self.stop_btn.clicked.connect(self.stop_service)
         self.stop_btn.setEnabled(False)
         header_layout.addWidget(self.stop_btn)
 
         # Check updates button
-        self.check_updates_btn = QPushButton("โฌ Check Updates")
+        self.check_updates_btn = QPushButton("Check Updates")
         self.check_updates_btn.setToolTip("Check for remote updates")
         self.check_updates_btn.clicked.connect(self.check_updates)
         header_layout.addWidget(self.check_updates_btn)
         # Install updates button
-        self.install_update_btn = QPushButton("โฌ Install Update")
+        self.install_update_btn = QPushButton("Install Update")
         self.install_update_btn.setToolTip("Run a staged installer from updates/")
         self.install_update_btn.clicked.connect(self.install_update)
         header_layout.addWidget(self.install_update_btn)
@@ -241,7 +242,7 @@ class MainController(QMainWindow):
         layout.addLayout(header_layout)
         
         # Tabs
-        self.tabs = FlexibleTabWidget()
+        self.tabs = SidebarTabWidget()
         
         self.tab_dashboard()
         self.tab_live_view()
@@ -274,16 +275,130 @@ class MainController(QMainWindow):
         # Status bar
         self.statusBar().showMessage("Ready")
     
+    def _kpi_card(self, title: str, attr: str) -> QFrame:
+        frame = QFrame()
+        frame.setStyleSheet("QFrame{background:#FFFFFF;border:1px solid #E3E3DD;border-radius:10px;}")
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(14, 10, 14, 12)
+        v.setSpacing(2)
+        t = QLabel(title)
+        t.setStyleSheet("color:#6B6B64;border:none;")
+        val = QLabel("0")
+        vf = QFont(); vf.setPointSize(19); vf.setBold(True)
+        val.setFont(vf)
+        val.setStyleSheet("color:#1A1A1A;border:none;")
+        setattr(self, attr, val)
+        v.addWidget(t)
+        v.addWidget(val)
+        return frame
+
+    def _build_kpi_header(self) -> QWidget:
+        container = QWidget()
+        box = QVBoxLayout(container)
+        box.setContentsMargins(0, 0, 0, 6)
+        box.setSpacing(10)
+
+        top = QHBoxLayout()
+        title = QLabel("แดชบอร์ด")
+        tf = QFont(); tf.setPointSize(15); tf.setBold(True)
+        title.setFont(tf)
+        self.kpi_status = QLabel("● หยุด")
+        self.kpi_status.setStyleSheet("color:#A32D2D;font-weight:500;")
+        top.addWidget(title)
+        top.addStretch()
+        top.addWidget(self.kpi_status)
+        box.addLayout(top)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        hero = QFrame()
+        hero.setStyleSheet("QFrame{background:#F5C518;border:none;border-radius:12px;}")
+        hv = QVBoxLayout(hero)
+        hv.setContentsMargins(16, 12, 16, 14)
+        hv.setSpacing(2)
+        hl = QLabel("ลูกค้าวันนี้")
+        hl.setStyleSheet("color:#161616;border:none;")
+        self.kpi_hero = QLabel("0")
+        hf = QFont(); hf.setPointSize(32); hf.setBold(True)
+        self.kpi_hero.setFont(hf)
+        self.kpi_hero.setStyleSheet("color:#161616;border:none;")
+        hv.addWidget(hl)
+        hv.addWidget(self.kpi_hero)
+        row.addWidget(hero, 2)
+        row.addWidget(self._kpi_card("ตัดผม", "kpi_haircuts"), 1)
+        row.addWidget(self._kpi_card("สระ", "kpi_washes"), 1)
+        row.addWidget(self._kpi_card("รอคิว", "kpi_waits"), 1)
+        row.addWidget(self._kpi_card("ในร้าน", "kpi_active"), 1)
+        box.addLayout(row)
+
+        grid_title = QLabel("กล้อง / โซนสด")
+        grid_title.setStyleSheet("color:#6B6B64;border:none;")
+        box.addWidget(grid_title)
+        self.kpi_grid_container = QWidget()
+        self.kpi_grid_layout = QGridLayout(self.kpi_grid_container)
+        self.kpi_grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.kpi_grid_layout.setSpacing(8)
+        box.addWidget(self.kpi_grid_container)
+        return container
+
+    def _chair_card(self, cam_name: str, connected: bool, people: int) -> QFrame:
+        if not connected:
+            bg, fg, status = "#FCEBEB", "#A32D2D", "ออฟไลน์"
+        elif people > 0:
+            bg, fg, status = "#FFF1C9", "#8A5412", f"{people} คน"
+        else:
+            bg, fg, status = "#F2F2EE", "#6B6B64", "ว่าง"
+        label = str(cam_name).replace("Camera_192_168_1_", "กล้อง .").replace("Camera_", "กล้อง ")
+        frame = QFrame()
+        frame.setStyleSheet(f"QFrame{{background:{bg};border:none;border-radius:10px;}}")
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(12, 9, 12, 10)
+        v.setSpacing(3)
+        t = QLabel(label)
+        t.setStyleSheet(f"color:{fg};border:none;font-weight:500;")
+        s = QLabel(status)
+        s.setStyleSheet(f"color:{fg};border:none;")
+        v.addWidget(t)
+        v.addWidget(s)
+        return frame
+
+    def _update_chair_grid(self, cameras: Dict[str, Any], people_map: Dict[str, int]) -> None:
+        if not hasattr(self, "kpi_grid_layout"):
+            return
+        try:
+            while self.kpi_grid_layout.count():
+                item = self.kpi_grid_layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+            col = 0
+            grid_row = 0
+            for cam_name, info in cameras.items():
+                if not info.get("enabled", True):
+                    continue
+                connected = bool(info.get("connected", False))
+                people = int(people_map.get(cam_name, self.cached_camera_people.get(cam_name, 0)))
+                self.kpi_grid_layout.addWidget(self._chair_card(cam_name, connected, people), grid_row, col)
+                col += 1
+                if col >= 3:
+                    col = 0
+                    grid_row += 1
+        except Exception as e:
+            logger.debug(f"chair grid update failed: {e}")
+
     def tab_dashboard(self):
         """Dashboard tab"""
         widget = QWidget()
         layout = QVBoxLayout()
         
+        # Redesigned KPI header (cards + live chair/camera grid)
+        layout.addWidget(self._build_kpi_header())
+
         # Status panel
         status_group_layout = QHBoxLayout()
         
         # Runtime status
-        self.status_runtime = QLabel("โซ Stopped")
+        self.status_runtime = QLabel("Stopped")
         self.status_runtime.setFont(QFont("Arial", 12, QFont.Bold))
         status_group_layout.addWidget(QLabel("Runtime:"))
         status_group_layout.addWidget(self.status_runtime)
@@ -291,7 +406,7 @@ class MainController(QMainWindow):
         status_group_layout.addSpacing(30)
         
         # AI Status
-        self.status_ai_model = QLabel("AI: ๐”ด Offline (Checking...)")
+        self.status_ai_model = QLabel("AI: Offline (Checking...)")
         self.status_ai_model.setStyleSheet("color: #E65100; font-weight: bold;")
         status_group_layout.addWidget(QLabel("Active AI Assist:"))
         status_group_layout.addWidget(self.status_ai_model)
@@ -427,23 +542,29 @@ class MainController(QMainWindow):
         layout.addLayout(tuning_box)
         
         # Auto-refresh indicator
-        self.auto_refresh_label = QLabel("๐” Auto-updating...")
+        self.auto_refresh_label = QLabel("Auto-updating...")
         self.auto_refresh_label.setStyleSheet("color: green; font-weight: bold;")
         layout.addWidget(self.auto_refresh_label)
         
         # Manual refresh button
-        refresh_btn = QPushButton("๐” Manual Refresh")
+        refresh_btn = QPushButton("Manual Refresh")
         refresh_btn.clicked.connect(self.refresh_dashboard)
         layout.addWidget(refresh_btn)
 
-        clear_btn = QPushButton("๐งน Clear Event Counts")
+        clear_btn = QPushButton("Clear Event Counts")
         clear_btn.clicked.connect(self.clear_event_counts)
         layout.addWidget(clear_btn)
         
         layout.addStretch()
         
         widget.setLayout(layout)
-        self.tabs.addTab(widget, "Dashboard")
+        # Wrap in a scroll area so the (tall) dashboard is never clipped when the
+        # window is shortened — all content stays reachable via scroll.
+        dash_scroll = QScrollArea()
+        dash_scroll.setWidgetResizable(True)
+        dash_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        dash_scroll.setWidget(widget)
+        self.tabs.addTab(dash_scroll, "Dashboard")
         
         # Store for update reference
         self.dashboard_widget = widget
@@ -574,7 +695,7 @@ class MainController(QMainWindow):
     def tab_live_view(self):
         """Live Viewer tab to see camera feed with zone overlays."""
         widget = LiveViewerWidget(self, config=self.config.data)
-        self.tabs.addTab(widget, "๐ฅ Live View")
+        self.tabs.addTab(widget, "Live View")
 
     def tab_setup(self):
         """Settings tab (launches setup wizard)."""
@@ -592,7 +713,7 @@ class MainController(QMainWindow):
         )
         layout.addWidget(info)
         
-        wizard_btn = QPushButton("โง Launch Setup Wizard")
+        wizard_btn = QPushButton("Launch Setup Wizard")
         wizard_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 10px;")
         wizard_btn.clicked.connect(self.launch_wizard)
         layout.addWidget(wizard_btn)
@@ -643,19 +764,19 @@ class MainController(QMainWindow):
         add_btn.clicked.connect(self.camera_manager.add_camera_dialog)
         actions_layout.addWidget(add_btn)
         
-        edit_btn = QPushButton("โ Edit Camera")
+        edit_btn = QPushButton("Edit Camera")
         edit_btn.clicked.connect(self.camera_manager.edit_camera_dialog)
         actions_layout.addWidget(edit_btn)
         
-        delete_btn = QPushButton("๐—‘ Delete Camera")
+        delete_btn = QPushButton("Delete Camera")
         delete_btn.clicked.connect(self.camera_manager.delete_camera)
         actions_layout.addWidget(delete_btn)
         
-        test_btn = QPushButton("โก Test Selected")
+        test_btn = QPushButton("Test Selected")
         test_btn.clicked.connect(self.camera_manager.test_camera)
         actions_layout.addWidget(test_btn)
         
-        test_all_btn = QPushButton("โก Test All")
+        test_all_btn = QPushButton("Test All")
         test_all_btn.clicked.connect(self.camera_manager.test_all_cameras)
         actions_layout.addWidget(test_all_btn)
         
@@ -664,11 +785,11 @@ class MainController(QMainWindow):
         # Import/Export
         import_export_layout = QHBoxLayout()
         
-        import_btn = QPushButton("๐“ฅ Import JSON")
+        import_btn = QPushButton("Import JSON")
         import_btn.clicked.connect(self.camera_manager.import_cameras_json)
         import_export_layout.addWidget(import_btn)
         
-        export_btn = QPushButton("๐“ค Export JSON")
+        export_btn = QPushButton("Export JSON")
         export_btn.clicked.connect(self.camera_manager.export_cameras_json)
         import_export_layout.addWidget(export_btn)
         
@@ -725,7 +846,7 @@ class MainController(QMainWindow):
         layout.addWidget(self.diagnostics_output)
 
         # Run button
-        run_btn = QPushButton("๐” Run Diagnostics")
+        run_btn = QPushButton("Run Diagnostics")
         run_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 10px;")
         run_btn.clicked.connect(self.run_diagnostics)
         layout.addWidget(run_btn)
@@ -1219,7 +1340,7 @@ class MainController(QMainWindow):
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
             
-            self.status_runtime.setText("๐ข Running")
+            self.status_runtime.setText("Running")
             self.status_runtime.setStyleSheet("color: green;")
             self.statusBar().showMessage("Service started")
             
@@ -1283,7 +1404,7 @@ class MainController(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         
-        self.status_runtime.setText("โซ Stopped")
+        self.status_runtime.setText("Stopped")
         self.status_runtime.setStyleSheet("color: red;")
         self.statusBar().showMessage("Service stopped")
         
@@ -1315,7 +1436,7 @@ class MainController(QMainWindow):
             
             # Update runtime status
             running = status.get("running", False)
-            self.status_runtime.setText("๐ข Running" if running else "โซ Stopped")
+            self.status_runtime.setText("Running" if running else "Stopped")
             self.status_runtime.setStyleSheet("color: green;" if running else "color: red;")
             
             # Update timestamp
@@ -1390,13 +1511,21 @@ class MainController(QMainWindow):
 
             # Snapshot list
             self.update_snapshot_list(status.get("recent_snapshots", []))
+
+            if hasattr(self, "kpi_status"):
+                self.kpi_status.setText("● กำลังทำงาน" if running else "● หยุด")
+                self.kpi_status.setStyleSheet(("color:#3B6D11;" if running else "color:#A32D2D;") + "font-weight:500;")
+            if hasattr(self, "kpi_active") and "active_tracks" in status:
+                self.kpi_active.setText(str(int(status.get("active_tracks", 0))))
+            self._update_chair_grid(cameras, status.get("camera_people", {}) or {})
+
             self._render_resources(status)
             self._render_effective_config(status)
             self._update_live_log_tail()
             
             # Update auto-refresh indicator
             if self.auto_refresh_label:
-                self.auto_refresh_label.setText("๐” Auto-updating...")
+                self.auto_refresh_label.setText("Auto-updating...")
         
         except Exception as e:
             logger.error(f"Error handling status update: {e}")
@@ -1411,6 +1540,15 @@ class MainController(QMainWindow):
             washes = summary.get("washes", summary.get("wash", 0))
             waits = summary.get("waits", summary.get("wait", 0))
             haircut_confirmed = summary.get("haircut_confirmed", haircuts)
+
+            if hasattr(self, "kpi_hero"):
+                self.kpi_hero.setText(str(haircuts))
+                self.kpi_haircuts.setText(str(haircuts))
+                self.kpi_washes.setText(str(washes))
+                self.kpi_waits.setText(str(waits))
+                _ap = summary.get("active_people")
+                if _ap is not None:
+                    self.kpi_active.setText(str(int(_ap)))
             
             text = f"""Haircuts: {haircuts}
 Washes: {washes}
@@ -1445,11 +1583,11 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         """Handle dashboard connection status change"""
         if connected:
             logger.info("Dashboard client connected")
-            self.auto_refresh_label.setText("๐ข Live")
+            self.auto_refresh_label.setText("Live")
             self.auto_refresh_label.setStyleSheet("color: green; font-weight: bold;")
         else:
             logger.warning("Dashboard client disconnected")
-            self.auto_refresh_label.setText("โ ๏ธ No connection")
+            self.auto_refresh_label.setText("No connection")
             self.auto_refresh_label.setStyleSheet("color: orange; font-weight: bold;")
 
     
@@ -1475,9 +1613,9 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             self.is_running = False
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
-            self.status_runtime.setText("โซ Stopped")
+            self.status_runtime.setText("Stopped")
             self.status_runtime.setStyleSheet("color: red;")
-            self.auto_refresh_label.setText("โ ๏ธ Services exited")
+            self.auto_refresh_label.setText("Services exited")
             self.auto_refresh_label.setStyleSheet("color: orange; font-weight: bold;")
             self.statusBar().showMessage("Services stopped unexpectedly")
         
@@ -1526,10 +1664,10 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
                     if summary:
                         self.on_summary_updated(summary)
                     if is_fresh and status.get("running", False):
-                        self.auto_refresh_label.setText("๐ข Live")
+                        self.auto_refresh_label.setText("Live")
                         self.auto_refresh_label.setStyleSheet("color: green; font-weight: bold;")
                     else:
-                        self.auto_refresh_label.setText("โ ๏ธ No recent runtime state")
+                        self.auto_refresh_label.setText("No recent runtime state")
                         self.auto_refresh_label.setStyleSheet("color: orange; font-weight: bold;")
             except Exception as e:
                 logger.warning(f"Failed to read dashboard state: {e}")
@@ -1630,6 +1768,25 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.resolve())))
 
+    def _relaunch_app(self):
+        """Spawn a detached relauncher that restarts the controller after this one exits."""
+        try:
+            root = self._project_root()
+            relauncher = root / 'scripts' / 'relaunch_controller.py'
+            kwargs = {}
+            if sys.platform.startswith('win'):
+                # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                kwargs['creationflags'] = 0x00000008 | 0x00000200
+            subprocess.Popen(
+                [sys.executable, str(relauncher), str(os.getpid()), str(root)],
+                cwd=str(root), close_fds=True, **kwargs)
+            logger.info('Relauncher spawned; closing controller for update restart')
+            QTimer.singleShot(500, self.close)
+        except Exception as e:
+            logger.error(f'Failed to relaunch after update: {e}')
+            QMessageBox.warning(self, 'Restart needed',
+                                f'Update applied, but auto-restart failed. Please restart manually.\n{e}')
+
     def check_updates(self):
         """Check remote metadata, download & verify primary asset, and stage it under `updates/`.
 
@@ -1649,6 +1806,12 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             self.statusBar().showMessage('Checking for updates...')
             metadata = updater.check_for_update(metadata_url)
             version, notes = updater.inspect_metadata_for_update(metadata)
+            current_version = str(CONFIG.get('version', '0') or '0')
+            if version and not is_newer(version, current_version):
+                QMessageBox.information(self, 'Up to date',
+                    f'Already on the latest version (current {current_version}, latest {version}).')
+                self.statusBar().showMessage('Already up to date', 5000)
+                return
             asset = updater.select_primary_asset(metadata)
             if not asset:
                 QMessageBox.information(self, 'No Update', 'No downloadable assets found in metadata.')
@@ -1701,24 +1864,28 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
                 QMessageBox.critical(self, 'Not found', f'Selected file not found: {chosen}')
                 return
 
-            # If archive, offer atomic deploy
+            # If archive, perform a SAFE code-only update (preserves venv/data/models/config).
             if chosen.suffix.lower() in ['.zip', '.tar', '.gz', '.bz2']:
-                reply = QMessageBox.question(self, 'Install Update', f'Detected archive {chosen.name}. Perform atomic deploy?', QMessageBox.Yes | QMessageBox.No)
+                reply = QMessageBox.question(self, 'Install Update',
+                    f'Install code update from {chosen.name}?\n\n'
+                    'Only application code is replaced. The venv, data, models and config are '
+                    'preserved and the replaced code is backed up. The controller restarts afterward.',
+                    QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
                     try:
                         updater = Updater(CONFIG.data if hasattr(CONFIG, 'data') else CONFIG)
                         root = self._project_root()
-                        # stop runtime service before deploying
-                        was_running = self.is_running
-                        if was_running:
+                        if self.is_running:
                             self.stop_service()
-                        deployed = updater.install_update_atomic(chosen, deploy_target=root)
-                        QMessageBox.information(self, 'Deployed', f'Update deployed to: {deployed}')
-                        # restart runtime service if it was running
-                        if was_running:
-                            self.start_service()
+                        result = updater.install_code_update(
+                            chosen, project_root=root, version=str(CONFIG.get('version', '')))
+                        QMessageBox.information(self, 'Update applied',
+                            'Updated: ' + ', '.join(result.get('copied') or ['(nothing)']) +
+                            (f"\nBackup: {result['backup']}" if result.get('backup') else '') +
+                            '\n\nThe controller will now restart.')
+                        self._relaunch_app()
                     except Exception as e:
-                        QMessageBox.critical(self, 'Deploy Failed', f'Atomic deploy failed: {e}')
+                        QMessageBox.critical(self, 'Update Failed', f'Code update failed: {e}')
                     return
 
             reply = QMessageBox.question(self, 'Install Update', f'Run installer: {chosen.name}?', QMessageBox.Yes | QMessageBox.No)
@@ -2602,19 +2769,19 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
                 models = [m["name"] for m in data.get("models", [])]
                 if models:
                     target = next((m for m in models if "llava" in m or "llama3" in m), models[0])
-                    self.status_ai_model.setText(f"AI: ๐ข {target}")
+                    self.status_ai_model.setText(f"AI: {target}")
                     self.status_ai_model.setStyleSheet("color: green; font-weight: bold;")
                 else:
-                    self.status_ai_model.setText("AI: ๐”ด No Models")
+                    self.status_ai_model.setText("AI: No Models")
                     self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
         except Exception:
-             self.status_ai_model.setText("AI: ๐”ด Offline (YOLO Only)")
+             self.status_ai_model.setText("AI: Offline (YOLO Only)")
              self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
 
     def tab_llm(self):
         from controller.llm_evaluation_ui import LLMEvaluationWidget
         self.llm_tab_widget = LLMEvaluationWidget()
-        self.tabs.addTab(self.llm_tab_widget, "๐ค– AI Evaluation")
+        self.tabs.addTab(self.llm_tab_widget, "AI Evaluation")
         
     def tab_cloud_sync(self):
         from controller.cloud_sync_widget import CloudSyncWidget
@@ -2622,13 +2789,14 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         cloud_scroll = QScrollArea()
         cloud_scroll.setWidgetResizable(True)
         cloud_scroll.setWidget(self.cloud_sync_widget)
-        self.tabs.addTab(cloud_scroll, "☁️ Cloud Sync")
+        self.tabs.addTab(cloud_scroll, "Cloud Sync")
 # =========================
 # MAIN
 # =========================
 
 def main():
     app = QApplication(sys.argv)
+    apply_theme(app)
     controller = MainController()
     controller.show()
     sys.exit(app.exec())
