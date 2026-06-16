@@ -521,3 +521,46 @@ class CCTVSupabaseRPCClient:
             "p_branch_name": (branch_name or "").strip() or None,
         }
         return self._rpc("ingest_cctv_daily_summary", payload)
+
+    # ------------------------------------------------------------------
+    # Model / config OTA (device-token authenticated)
+    # Requires the SECURITY DEFINER RPCs in
+    # supabase/migrations/20260616_cctv_device_ota.sql
+    # ------------------------------------------------------------------
+    def get_cctv_runtime_bootstrap(self, device_token: str) -> Dict[str, Any]:
+        """Return the active config + active model for this device's branch.
+
+        Expected shape:
+          {"config": {...} | null,
+           "model": {"id","model_version","storage_bucket","storage_path",
+                     "sha256","signed_url"?} | null}
+        """
+        data = self._rpc("get_cctv_runtime_bootstrap", {
+            "p_device_token": (device_token or "").strip(),
+        })
+        return self._first_row(data) if not isinstance(data, dict) else data
+
+    def log_cctv_model_download(self, device_token: str, model_id: Optional[str],
+                                model_version: Optional[str], status: str,
+                                message: Optional[str] = None,
+                                sha256_ok: Optional[bool] = None) -> Any:
+        """Record a model-download outcome (success/failed) via a device-token RPC."""
+        return self._rpc("log_cctv_model_download", {
+            "p_device_token": (device_token or "").strip(),
+            "p_model_id": model_id,
+            "p_model_version": model_version,
+            "p_status": status,
+            "p_message": message,
+            "p_sha256_ok": sha256_ok,
+        })
+
+    def download_storage_object(self, bucket: str, path: str) -> bytes:
+        """Download an object from Supabase Storage via the connected client.
+
+        Works when the device has read access to the path (a device/anon read
+        policy on the bucket, or a public bucket). If the bootstrap RPC returns a
+        `signed_url` instead, fetch that URL directly rather than calling this.
+        """
+        if not self.ensure_connected():
+            raise RuntimeError("Supabase client is not connected")
+        return self.client.storage.from_(bucket).download(path)
