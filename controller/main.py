@@ -1,10 +1,10 @@
-"""
+﻿"""
 Main Controller Application
 
 Features:
 - Dashboard: Status overview
 - Setup Wizard: Configuration steps
-- Camera Management
+- Camera Manag_ement
 - Zone Editing
 - Staff DB Builder
 - Diagnostics
@@ -30,9 +30,10 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QTextEdit, QSplitter, QSpinBox, QFileDialog,
     QListWidget, QListWidgetItem, QDoubleSpinBox, QComboBox, QLineEdit,
     QFormLayout, QGroupBox, QProgressBar, QTableWidget, QTableWidgetItem,
+    QCheckBox, QScrollArea,
     QHeaderView
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize
 from PySide6.QtGui import QIcon, QFont, QColor, QDesktopServices, QImage, QPixmap
 from PySide6.QtCore import QUrl
 
@@ -48,6 +49,7 @@ from controller.camera_manager import CameraManagerWidget
 from controller.zone_editor import ZoneEditorWidget
 from controller.staff_builder import StaffBuilderWidget
 from controller.live_viewer import LiveViewerWidget
+from controller.performance_widget import PerformanceWidget
 
 # =========================
 # SETUP
@@ -88,9 +90,47 @@ class CommandWorker(QObject):
             self.finished.emit(1, "\n".join(logs + [msg]))
 
 
+
+
+
+    def _check_ai_model(self):
+        try:
+            import urllib.request, json
+            req = urllib.request.Request("http://127.0.0.1:11434/api/tags")
+            with urllib.request.urlopen(req, timeout=1) as response:
+                data = json.loads(response.read().decode())
+                models = [m["name"] for m in data.get("models", [])]
+                if models:
+                    target = next((m for m in models if "llava" in m or "llama3" in m), models[0])
+                    self.status_ai_model.setText(f"AI: ๐ข {target}")
+                    self.status_ai_model.setStyleSheet("color: green; font-weight: bold;")
+                else:
+                    self.status_ai_model.setText("AI: ๐”ด No Models")
+                    self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
+        except Exception:
+             self.status_ai_model.setText("AI: ๐”ด Offline (YOLO Only)")
+             self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
+
+    def tab_llm(self):
+        from controller.llm_evaluation_ui import LLMEvaluationWidget
+        self.llm_tab_widget = LLMEvaluationWidget()
+        self.tabs.addTab(self.llm_tab_widget, "๐ค– AI Evaluation")
+        
+    def tab_cloud_sync(self):
+        from controller.cloud_sync_widget import CloudSyncWidget
+        self.cloud_sync_widget = CloudSyncWidget(self.config_manager)
+        self.tabs.addTab(self.cloud_sync_widget, "โ๏ธ Cloud Sync")
+
 # =========================
 # MAIN CONTROLLER
 # =========================
+
+class FlexibleTabWidget(QTabWidget):
+    """QTabWidget with a relaxed minimum size to allow shorter window heights."""
+
+    def minimumSizeHint(self):
+        return QSize(640, 360)
+
 
 class MainController(QMainWindow):
     """Main Controller Application"""
@@ -176,24 +216,24 @@ class MainController(QMainWindow):
         header_layout.addStretch()
         
         # Start/Stop button
-        self.start_btn = QPushButton("▶ Start Service")
+        self.start_btn = QPushButton("โ–ถ Start Service")
         self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;")
         self.start_btn.clicked.connect(self.start_service)
         header_layout.addWidget(self.start_btn)
         
-        self.stop_btn = QPushButton("⏹ Stop Service")
+        self.stop_btn = QPushButton("โน Stop Service")
         self.stop_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 5px;")
         self.stop_btn.clicked.connect(self.stop_service)
         self.stop_btn.setEnabled(False)
         header_layout.addWidget(self.stop_btn)
 
         # Check updates button
-        self.check_updates_btn = QPushButton("⬆ Check Updates")
+        self.check_updates_btn = QPushButton("โฌ Check Updates")
         self.check_updates_btn.setToolTip("Check for remote updates")
         self.check_updates_btn.clicked.connect(self.check_updates)
         header_layout.addWidget(self.check_updates_btn)
         # Install updates button
-        self.install_update_btn = QPushButton("⬇ Install Update")
+        self.install_update_btn = QPushButton("โฌ Install Update")
         self.install_update_btn.setToolTip("Run a staged installer from updates/")
         self.install_update_btn.clicked.connect(self.install_update)
         header_layout.addWidget(self.install_update_btn)
@@ -201,12 +241,14 @@ class MainController(QMainWindow):
         layout.addLayout(header_layout)
         
         # Tabs
-        self.tabs = QTabWidget()
+        self.tabs = FlexibleTabWidget()
         
         self.tab_dashboard()
         self.tab_live_view()
         self.tab_setup()
         self.tab_cameras()
+        self.tab_llm()
+        self.tab_cloud_sync()
         # Staff DB Builder
         try:
             self.tab_staff_db()
@@ -218,6 +260,7 @@ class MainController(QMainWindow):
         except Exception:
             # If zone editor fails to initialize, continue gracefully
             logger.exception("Failed to initialize Zones tab")
+        self.tab_performance()
         self.tab_diagnostics()
         self.tab_logs()
         self.tab_model_train()
@@ -240,10 +283,18 @@ class MainController(QMainWindow):
         status_group_layout = QHBoxLayout()
         
         # Runtime status
-        self.status_runtime = QLabel("⚫ Stopped")
+        self.status_runtime = QLabel("โซ Stopped")
         self.status_runtime.setFont(QFont("Arial", 12, QFont.Bold))
         status_group_layout.addWidget(QLabel("Runtime:"))
         status_group_layout.addWidget(self.status_runtime)
+        
+        status_group_layout.addSpacing(30)
+        
+        # AI Status
+        self.status_ai_model = QLabel("AI: ๐”ด Offline (Checking...)")
+        self.status_ai_model.setStyleSheet("color: #E65100; font-weight: bold;")
+        status_group_layout.addWidget(QLabel("Active AI Assist:"))
+        status_group_layout.addWidget(self.status_ai_model)
         
         status_group_layout.addSpacing(30)
         
@@ -376,16 +427,16 @@ class MainController(QMainWindow):
         layout.addLayout(tuning_box)
         
         # Auto-refresh indicator
-        self.auto_refresh_label = QLabel("🔄 Auto-updating...")
+        self.auto_refresh_label = QLabel("๐” Auto-updating...")
         self.auto_refresh_label.setStyleSheet("color: green; font-weight: bold;")
         layout.addWidget(self.auto_refresh_label)
         
         # Manual refresh button
-        refresh_btn = QPushButton("🔄 Manual Refresh")
+        refresh_btn = QPushButton("๐” Manual Refresh")
         refresh_btn.clicked.connect(self.refresh_dashboard)
         layout.addWidget(refresh_btn)
 
-        clear_btn = QPushButton("🧹 Clear Event Counts")
+        clear_btn = QPushButton("๐งน Clear Event Counts")
         clear_btn.clicked.connect(self.clear_event_counts)
         layout.addWidget(clear_btn)
         
@@ -523,10 +574,10 @@ class MainController(QMainWindow):
     def tab_live_view(self):
         """Live Viewer tab to see camera feed with zone overlays."""
         widget = LiveViewerWidget(self, config=self.config.data)
-        self.tabs.addTab(widget, "🎥 Live View")
+        self.tabs.addTab(widget, "๐ฅ Live View")
 
     def tab_setup(self):
-        """Setup tab"""
+        """Settings tab (launches setup wizard)."""
         widget = QWidget()
         layout = QVBoxLayout()
         
@@ -541,7 +592,7 @@ class MainController(QMainWindow):
         )
         layout.addWidget(info)
         
-        wizard_btn = QPushButton("✧ Launch Setup Wizard")
+        wizard_btn = QPushButton("โง Launch Setup Wizard")
         wizard_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 10px;")
         wizard_btn.clicked.connect(self.launch_wizard)
         layout.addWidget(wizard_btn)
@@ -549,7 +600,7 @@ class MainController(QMainWindow):
         layout.addStretch()
         
         widget.setLayout(layout)
-        self.tabs.addTab(widget, "Setup Wizard")
+        self.tabs.addTab(widget, "Settings")
     
     def tab_cameras(self):
         """Cameras tab"""
@@ -578,7 +629,7 @@ class MainController(QMainWindow):
             item = QTreeWidgetItem([
                 cam_name,
                 cam_config.get("rtsp_url", "")[:40],
-                "✓" if cam_config.get("enabled", True) else "✗",
+                "โ“" if cam_config.get("enabled", True) else "โ—",
                 cam_config.get("zones_file", "")
             ])
             self.camera_list.addTopLevelItem(item)
@@ -592,19 +643,19 @@ class MainController(QMainWindow):
         add_btn.clicked.connect(self.camera_manager.add_camera_dialog)
         actions_layout.addWidget(add_btn)
         
-        edit_btn = QPushButton("✎ Edit Camera")
+        edit_btn = QPushButton("โ Edit Camera")
         edit_btn.clicked.connect(self.camera_manager.edit_camera_dialog)
         actions_layout.addWidget(edit_btn)
         
-        delete_btn = QPushButton("🗑 Delete Camera")
+        delete_btn = QPushButton("๐—‘ Delete Camera")
         delete_btn.clicked.connect(self.camera_manager.delete_camera)
         actions_layout.addWidget(delete_btn)
         
-        test_btn = QPushButton("⚡ Test Selected")
+        test_btn = QPushButton("โก Test Selected")
         test_btn.clicked.connect(self.camera_manager.test_camera)
         actions_layout.addWidget(test_btn)
         
-        test_all_btn = QPushButton("⚡ Test All")
+        test_all_btn = QPushButton("โก Test All")
         test_all_btn.clicked.connect(self.camera_manager.test_all_cameras)
         actions_layout.addWidget(test_all_btn)
         
@@ -613,11 +664,11 @@ class MainController(QMainWindow):
         # Import/Export
         import_export_layout = QHBoxLayout()
         
-        import_btn = QPushButton("📥 Import JSON")
+        import_btn = QPushButton("๐“ฅ Import JSON")
         import_btn.clicked.connect(self.camera_manager.import_cameras_json)
         import_export_layout.addWidget(import_btn)
         
-        export_btn = QPushButton("📤 Export JSON")
+        export_btn = QPushButton("๐“ค Export JSON")
         export_btn.clicked.connect(self.camera_manager.export_cameras_json)
         import_export_layout.addWidget(export_btn)
         
@@ -658,6 +709,11 @@ class MainController(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load Zone Editor: {e}")
             logger.exception("Zone Editor initialization error")
+
+    def tab_performance(self):
+        """Performance analytics tab."""
+        widget = PerformanceWidget(self.config.data, self)
+        self.tabs.addTab(widget, "Performance")
     
     def tab_diagnostics(self):
         """Diagnostics tab"""
@@ -669,7 +725,7 @@ class MainController(QMainWindow):
         layout.addWidget(self.diagnostics_output)
 
         # Run button
-        run_btn = QPushButton("🔍 Run Diagnostics")
+        run_btn = QPushButton("๐” Run Diagnostics")
         run_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 10px;")
         run_btn.clicked.connect(self.run_diagnostics)
         layout.addWidget(run_btn)
@@ -755,6 +811,22 @@ class MainController(QMainWindow):
         self.train_device = QComboBox()
         self.train_device.addItems(["auto", "cpu", "mps", "cuda"])
         self.train_device.setCurrentText("cpu")
+        
+        # Enhanced training parameters
+        self.train_patience = QSpinBox()
+        self.train_patience.setRange(1, 100)
+        self.train_patience.setValue(30)
+        self.train_checkpoint_period = QSpinBox()
+        self.train_checkpoint_period.setRange(1, 50)
+        self.train_checkpoint_period.setValue(10)
+        self.train_hyperparameter_opt = QCheckBox("Enable Hyperparameter Optimization")
+        self.train_opt_iters = QSpinBox()
+        self.train_opt_iters.setRange(10, 200)
+        self.train_opt_iters.setValue(50)
+        self.train_opt_iters.setEnabled(False)
+        self.train_hyperparameter_opt.stateChanged.connect(
+            lambda state: self.train_opt_iters.setEnabled(state == Qt.Checked)
+        )
 
         train_data_row = QWidget()
         train_data_row_l = QHBoxLayout()
@@ -775,6 +847,10 @@ class MainController(QMainWindow):
         form.addRow("Image Size", self.train_imgsz)
         form.addRow("Batch", self.train_batch)
         form.addRow("Device", self.train_device)
+        form.addRow("Patience (Early Stopping)", self.train_patience)
+        form.addRow("Checkpoint Period", self.train_checkpoint_period)
+        form.addRow(self.train_hyperparameter_opt)
+        form.addRow("Optimization Iterations", self.train_opt_iters)
         layout.addLayout(form)
 
         actions = QHBoxLayout()
@@ -829,6 +905,10 @@ class MainController(QMainWindow):
         self.eval_device = QComboBox()
         self.eval_device.addItems(["auto", "cpu", "mps", "cuda"])
         self.eval_device.setCurrentText("cpu")
+        
+        # Enhanced evaluation parameters
+        self.eval_verbose = QCheckBox("Verbose Output")
+        self.eval_per_class = QCheckBox("Per-Class Metrics")
 
         eval_weights_row = QWidget()
         eval_weights_row_l = QHBoxLayout()
@@ -848,6 +928,8 @@ class MainController(QMainWindow):
         form.addRow("Image Size", self.eval_imgsz)
         form.addRow("Batch", self.eval_batch)
         form.addRow("Device", self.eval_device)
+        form.addRow(self.eval_verbose)
+        form.addRow(self.eval_per_class)
         layout.addLayout(form)
 
         eval_btn_row = QHBoxLayout()
@@ -1079,7 +1161,7 @@ class MainController(QMainWindow):
     
     def launch_wizard(self):
         """Launch setup wizard"""
-        # SetupWizard is a QMainWindow (not QDialog) — show it modelessly
+        # SetupWizard is a QMainWindow (not QDialog) โ€” show it modelessly
         self.wizard_window = SetupWizard()
         self.wizard_window.show()
 
@@ -1137,7 +1219,7 @@ class MainController(QMainWindow):
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
             
-            self.status_runtime.setText("🟢 Running")
+            self.status_runtime.setText("๐ข Running")
             self.status_runtime.setStyleSheet("color: green;")
             self.statusBar().showMessage("Service started")
             
@@ -1201,7 +1283,7 @@ class MainController(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         
-        self.status_runtime.setText("⚫ Stopped")
+        self.status_runtime.setText("โซ Stopped")
         self.status_runtime.setStyleSheet("color: red;")
         self.statusBar().showMessage("Service stopped")
         
@@ -1233,7 +1315,7 @@ class MainController(QMainWindow):
             
             # Update runtime status
             running = status.get("running", False)
-            self.status_runtime.setText("🟢 Running" if running else "⚫ Stopped")
+            self.status_runtime.setText("๐ข Running" if running else "โซ Stopped")
             self.status_runtime.setStyleSheet("color: green;" if running else "color: red;")
             
             # Update timestamp
@@ -1267,7 +1349,7 @@ class MainController(QMainWindow):
                     # fall back to cached per-camera value or 0 if unknown
                     cam_people = int(self.cached_camera_people.get(cam_name, 0))
                 
-                status_icon = "✓" if connected else "✗"
+                status_icon = "โ“" if connected else "โ—"
                 status_color = "green" if connected else ("gray" if not enabled else "red")
                 
                 item = QTreeWidgetItem([
@@ -1314,7 +1396,7 @@ class MainController(QMainWindow):
             
             # Update auto-refresh indicator
             if self.auto_refresh_label:
-                self.auto_refresh_label.setText("🔄 Auto-updating...")
+                self.auto_refresh_label.setText("๐” Auto-updating...")
         
         except Exception as e:
             logger.error(f"Error handling status update: {e}")
@@ -1363,11 +1445,11 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         """Handle dashboard connection status change"""
         if connected:
             logger.info("Dashboard client connected")
-            self.auto_refresh_label.setText("🟢 Live")
+            self.auto_refresh_label.setText("๐ข Live")
             self.auto_refresh_label.setStyleSheet("color: green; font-weight: bold;")
         else:
             logger.warning("Dashboard client disconnected")
-            self.auto_refresh_label.setText("⚠️ No connection")
+            self.auto_refresh_label.setText("โ ๏ธ No connection")
             self.auto_refresh_label.setStyleSheet("color: orange; font-weight: bold;")
 
     
@@ -1393,9 +1475,9 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             self.is_running = False
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
-            self.status_runtime.setText("⚫ Stopped")
+            self.status_runtime.setText("โซ Stopped")
             self.status_runtime.setStyleSheet("color: red;")
-            self.auto_refresh_label.setText("⚠️ Services exited")
+            self.auto_refresh_label.setText("โ ๏ธ Services exited")
             self.auto_refresh_label.setStyleSheet("color: orange; font-weight: bold;")
             self.statusBar().showMessage("Services stopped unexpectedly")
         
@@ -1444,10 +1526,10 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
                     if summary:
                         self.on_summary_updated(summary)
                     if is_fresh and status.get("running", False):
-                        self.auto_refresh_label.setText("🟢 Live")
+                        self.auto_refresh_label.setText("๐ข Live")
                         self.auto_refresh_label.setStyleSheet("color: green; font-weight: bold;")
                     else:
-                        self.auto_refresh_label.setText("⚠️ No recent runtime state")
+                        self.auto_refresh_label.setText("โ ๏ธ No recent runtime state")
                         self.auto_refresh_label.setStyleSheet("color: orange; font-weight: bold;")
             except Exception as e:
                 logger.warning(f"Failed to read dashboard state: {e}")
@@ -1758,7 +1840,7 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         # Supabase config check
         sup = self.config.get('supabase', {})
         if sup.get('url') and sup.get('key'):
-            lines.append("Supabase: config present (url/key) — will require runtime test to verify connectivity")
+            lines.append("Supabase: config present (url/key) โ€” will require runtime test to verify connectivity")
         else:
             lines.append("Supabase: missing url/key in config")
 
@@ -1957,8 +2039,18 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             "--imgsz", str(int(self.train_imgsz.value())),
             "--batch", str(int(self.train_batch.value())),
             "--device", self.train_device.currentText(),
+            "--patience", str(int(self.train_patience.value())),
+            "--checkpoint-period", str(int(self.train_checkpoint_period.value())),
             "--exist-ok",
         ]
+        
+        # Add hyperparameter optimization flags if enabled
+        if self.train_hyperparameter_opt.isChecked():
+            cmd.extend([
+                "--hyperparameter-opt",
+                "--opt-iters", str(int(self.train_opt_iters.value()))
+            ])
+
         self.train_output.append(f"$ {' '.join(cmd)}")
 
         def on_finish(code: int, output: str):
@@ -1997,6 +2089,13 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             "--batch", str(int(self.eval_batch.value())),
             "--device", self.eval_device.currentText(),
         ]
+        
+        # Add enhanced evaluation flags if enabled
+        if self.eval_verbose.isChecked():
+            cmd.append("--verbose")
+        if self.eval_per_class.isChecked():
+            cmd.append("--per-class")
+
         self.eval_output.append(f"$ {' '.join(cmd)}")
 
         def on_finish(code: int, output: str):
@@ -2400,7 +2499,7 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             self.statusBar().showMessage(f"Saved all imported images: {ok_count}/{total}", 5000)
     
     def save_config(self):
-        """Save config ไฟล์ (สำหรับ camera manager เป็นต้น)"""
+        """Save config เนเธเธฅเน (เธชเธณเธซเธฃเธฑเธ camera manager เน€เธเนเธเธ•เนเธ)"""
         try:
             CONFIG.set_all(self.config)
             logger.info("Config saved successfully")
@@ -2491,6 +2590,39 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             QMessageBox.critical(self, 'Error', f'Cannot open logs folder: {e}')
 
 
+
+
+
+    def _check_ai_model(self):
+        try:
+            import urllib.request, json
+            req = urllib.request.Request("http://127.0.0.1:11434/api/tags")
+            with urllib.request.urlopen(req, timeout=1) as response:
+                data = json.loads(response.read().decode())
+                models = [m["name"] for m in data.get("models", [])]
+                if models:
+                    target = next((m for m in models if "llava" in m or "llama3" in m), models[0])
+                    self.status_ai_model.setText(f"AI: ๐ข {target}")
+                    self.status_ai_model.setStyleSheet("color: green; font-weight: bold;")
+                else:
+                    self.status_ai_model.setText("AI: ๐”ด No Models")
+                    self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
+        except Exception:
+             self.status_ai_model.setText("AI: ๐”ด Offline (YOLO Only)")
+             self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
+
+    def tab_llm(self):
+        from controller.llm_evaluation_ui import LLMEvaluationWidget
+        self.llm_tab_widget = LLMEvaluationWidget()
+        self.tabs.addTab(self.llm_tab_widget, "๐ค– AI Evaluation")
+        
+    def tab_cloud_sync(self):
+        from controller.cloud_sync_widget import CloudSyncWidget
+        self.cloud_sync_widget = CloudSyncWidget(self)
+        cloud_scroll = QScrollArea()
+        cloud_scroll.setWidgetResizable(True)
+        cloud_scroll.setWidget(self.cloud_sync_widget)
+        self.tabs.addTab(cloud_scroll, "☁️ Cloud Sync")
 # =========================
 # MAIN
 # =========================
@@ -2504,3 +2636,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

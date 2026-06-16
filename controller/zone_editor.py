@@ -45,8 +45,9 @@ class PolygonCanvas(QWidget):
         self._drag_poly: Optional[int] = None
         self._drag_point: Optional[int] = None
         self.undo_stack: List[Dict] = []
+        self.last_finished: List[QPointF] = []
         # Allow a smaller editor window on compact displays
-        self.setMinimumSize(480, 270)
+        self.setMinimumSize(320, 180)
 
     def load_image(self, qimage: QImage):
         self.image = qimage
@@ -144,8 +145,9 @@ class PolygonCanvas(QWidget):
                 self.current.append(pos_norm)
             self.update()
         elif event.button() == Qt.RightButton:
-            # finish polygon
+            # finish polygon (keep copy so editor can create zone from it)
             if len(self.current) >= 3:
+                self.last_finished = self.current.copy()
                 self.polygons.append(self.current.copy())
                 # save undo snapshot
                 try:
@@ -202,7 +204,8 @@ class PolygonCanvas(QWidget):
         # store deep copy of polygons and current
         self.undo_stack.append({
             "polygons": copy.deepcopy(self.polygons),
-            "current": copy.deepcopy(self.current)
+            "current": copy.deepcopy(self.current),
+            "last_finished": copy.deepcopy(self.last_finished),
         })
 
     def undo(self):
@@ -211,6 +214,7 @@ class PolygonCanvas(QWidget):
         snap = self.undo_stack.pop()
         self.polygons = snap.get("polygons", [])
         self.current = snap.get("current", [])
+        self.last_finished = snap.get("last_finished", [])
         self.update()
 
     def clear_current(self):
@@ -218,6 +222,7 @@ class PolygonCanvas(QWidget):
         if self.current:
             self.push_undo()
         self.current = []
+        self.last_finished = []
         self.update()
 
     def clear_all(self):
@@ -226,6 +231,7 @@ class PolygonCanvas(QWidget):
             self.push_undo()
         self.polygons = []
         self.current = []
+        self.last_finished = []
         self.selected_idx = None
         self.update()
 
@@ -291,19 +297,30 @@ class ZoneEditorWidget(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout()
+        self.help_label = QLabel(
+            "Workflow: Select camera -> Load Snapshot -> Left click to add points -> "
+            "Create/Update Zone (drag point to move, double-click point to delete)"
+        )
+        self.help_label.setWordWrap(True)
+        self.help_label.setStyleSheet("color: #666;")
+        layout.addWidget(self.help_label)
         hl = QHBoxLayout()
         # Camera selector
         hl.addWidget(QLabel("Camera:"))
         self.camera_selector = QComboBox()
         self.reload_cameras()
-        hl.addWidget(self.camera_selector)
+        hl.addWidget(self.camera_selector, 1)
         self.camera_selector.currentTextChanged.connect(self.on_camera_selected)
+
+        reload_cam_btn = QPushButton("Reload Cameras")
+        reload_cam_btn.clicked.connect(self.reload_cameras)
+        hl.addWidget(reload_cam_btn)
         
         load_btn = QPushButton("Load Snapshot")
         load_btn.clicked.connect(self.load_snapshot_from_selected)
         hl.addWidget(load_btn)
 
-        undo_btn = QPushButton("↶ Undo")
+        undo_btn = QPushButton("Undo")
         undo_btn.clicked.connect(self.canvas.undo)
         hl.addWidget(undo_btn)
 
@@ -316,72 +333,157 @@ class ZoneEditorWidget(QWidget):
         hl.addWidget(loadzones_btn)
 
         layout.addLayout(hl)
-        layout.addWidget(self.canvas)
+        layout.addWidget(self.canvas, 1)
 
         # Zone properties
         prop_h = QHBoxLayout()
         prop_h.addWidget(QLabel("Zone Name:"))
         self.zone_name = QLineEdit()
+        self.zone_name.setPlaceholderText("e.g. CHAIR_01")
+        self.zone_name.returnPressed.connect(self.create_zone_from_current)
         prop_h.addWidget(self.zone_name)
         prop_h.addWidget(QLabel("Type:"))
         self.zone_type = QComboBox()
         self.zone_type.addItems(ZoneTypeChoices)
         prop_h.addWidget(self.zone_type)
 
-        add_zone_btn = QPushButton("Create Zone from Current")
+        add_zone_btn = QPushButton("Create / Update Zone")
         add_zone_btn.clicked.connect(self.create_zone_from_current)
         prop_h.addWidget(add_zone_btn)
 
+        new_zone_btn = QPushButton("New Zone")
+        new_zone_btn.clicked.connect(self.start_new_zone)
+        prop_h.addWidget(new_zone_btn)
+
         clear_current_btn = QPushButton("Clear Current")
-        clear_current_btn.clicked.connect(self.canvas.clear_current)
+        clear_current_btn.clicked.connect(self.clear_current_points)
         prop_h.addWidget(clear_current_btn)
 
         clear_all_btn = QPushButton("Clear All")
-        clear_all_btn.clicked.connect(self.canvas.clear_all)
+        clear_all_btn.clicked.connect(self.clear_all_points)
         prop_h.addWidget(clear_all_btn)
 
         layout.addLayout(prop_h)
 
+        info_row = QHBoxLayout()
+        self.zone_count_label = QLabel("Zones: 0")
+        info_row.addWidget(self.zone_count_label)
+        info_row.addStretch()
+        layout.addLayout(info_row)
+
         # Zone list
         self.zone_list = QListWidget()
+        self.zone_list.setAlternatingRowColors(True)
         self.zone_list.currentRowChanged.connect(self.on_zone_selected)
         layout.addWidget(self.zone_list)
 
         # Zone actions
         zone_actions = QHBoxLayout()
-        del_zone_btn = QPushButton("Delete Selected Zone")
-        del_zone_btn.clicked.connect(self.delete_selected_zone)
-        zone_actions.addWidget(del_zone_btn)
         edit_zone_btn = QPushButton("Edit Selected Zone")
         edit_zone_btn.clicked.connect(self.edit_selected_zone)
         zone_actions.addWidget(edit_zone_btn)
+        del_zone_btn = QPushButton("Delete Selected Zone")
+        del_zone_btn.clicked.connect(self.delete_selected_zone)
+        zone_actions.addWidget(del_zone_btn)
+        zone_actions.addStretch()
         layout.addLayout(zone_actions)
 
+        self.status_label = QLabel("Ready")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #2e7d32;")
+        layout.addWidget(self.status_label)
+
         self.setLayout(layout)
+        self.start_new_zone()
+
+    def _set_status(self, message: str, is_error: bool = False):
+        color = "#c62828" if is_error else "#2e7d32"
+        if hasattr(self, "status_label"):
+            self.status_label.setStyleSheet(f"color: {color};")
+            self.status_label.setText(message)
+
+    def _refresh_zone_list_ui(self, cam: Optional[str] = None):
+        target_cam = cam or self.current_camera or self.camera_selector.currentText()
+        self.zone_list.clear()
+        if not target_cam:
+            self.zone_count_label.setText("Zones: 0")
+            return
+        cam_zones = self.zones.get(target_cam, [])
+        for i, z in enumerate(cam_zones, start=1):
+            name = z.get("name", "")
+            ztype = z.get("type", "")
+            self.zone_list.addItem(QListWidgetItem(f"{i}. {name} ({ztype})"))
+        self.zone_count_label.setText(f"Zones: {len(cam_zones)}")
+
+    def _suggest_zone_name(self) -> str:
+        cam = self.current_camera or self.camera_selector.currentText()
+        zone_type = self.zone_type.currentText() if hasattr(self, "zone_type") else "ZONE"
+        prefix = zone_type or "ZONE"
+        existing = self.zones.get(cam, []) if cam else []
+        return f"{prefix}_{len(existing) + 1:02d}"
+
+    def _active_points_for_zone(self) -> List[QPointF]:
+        if len(self.canvas.current) >= 3:
+            return list(self.canvas.current)
+        if len(self.canvas.last_finished) >= 3:
+            return list(self.canvas.last_finished)
+        return []
+
+    def start_new_zone(self):
+        self.zone_list.blockSignals(True)
+        self.zone_list.clearSelection()
+        self.zone_list.setCurrentRow(-1)
+        self.zone_list.blockSignals(False)
+        self.canvas.clear_current()
+        self.zone_name.setText(self._suggest_zone_name())
+        self._set_status("Ready to draw a new zone")
+
+    def clear_current_points(self):
+        self.canvas.clear_current()
+        self._set_status("Cleared current drawing")
+
+    def clear_all_points(self):
+        self.canvas.clear_all()
+        self._set_status("Cleared all polygons on canvas")
 
     def reload_cameras(self):
+        prev = self.camera_selector.currentText() if hasattr(self, "camera_selector") else ""
+        cameras = self.config.get("cameras", {}) or {}
+        self.camera_selector.blockSignals(True)
         self.camera_selector.clear()
-        cameras = self.config.get("cameras", {})
         for name in cameras.keys():
             self.camera_selector.addItem(name)
+        if prev and prev in cameras:
+            self.camera_selector.setCurrentText(prev)
+        elif self.current_camera and self.current_camera in cameras:
+            self.camera_selector.setCurrentText(self.current_camera)
+        self.camera_selector.blockSignals(False)
+        if cameras:
+            self._set_status(f"Cameras loaded: {len(cameras)}")
+        else:
+            self._set_status("No cameras configured", is_error=True)
 
     def on_camera_selected(self, index):
         cam = self.camera_selector.currentText()
         if cam:
             self.current_camera = cam
             self.canvas.clear_all()  # clear previous camera drawing
-            self.load_zones()  # auto load zones for selected camera
+            self.load_zones(show_notice=False)  # auto load zones for selected camera
+            self.start_new_zone()
+            self._set_status(f"Selected camera: {cam}")
 
     def load_snapshot_from_selected(self):
         cam = self.camera_selector.currentText()
         if not cam:
             QMessageBox.warning(self, "Error", "No camera selected")
+            self._set_status("No camera selected", is_error=True)
             return
         self.current_camera = cam
         cam_conf = self.config.get("cameras", {}).get(cam, {})
         url = cam_conf.get("rtsp_url")
         if not url:
             QMessageBox.warning(self, "Error", "RTSP URL not configured for this camera")
+            self._set_status(f"RTSP URL missing for {cam}", is_error=True)
             return
         # try to read one frame using OpenCV
         try:
@@ -390,6 +492,7 @@ class ZoneEditorWidget(QWidget):
             cap.release()
             if not ret:
                 QMessageBox.critical(self, "Error", "Cannot capture frame from camera")
+                self._set_status(f"Cannot capture frame from {cam}", is_error=True)
                 return
             # convert to QImage
             h, w, ch = frame.shape
@@ -402,26 +505,29 @@ class ZoneEditorWidget(QWidget):
                 for z in cam_zones:
                     z["points"] = self._normalized_points(z.get("points", []), image_size=(w, h))
                 self._refresh_canvas_polygons()
-            QMessageBox.information(self, "Snapshot", "Snapshot loaded")
+            self._set_status(f"Snapshot loaded for {cam} ({w}x{h})")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Snapshot failed: {e}")
+            self._set_status(f"Snapshot failed: {e}", is_error=True)
 
     def create_zone_from_current(self):
         name = self.zone_name.text().strip()
         if not name:
             QMessageBox.warning(self, "Error", "Zone name required")
+            self._set_status("Zone name required", is_error=True)
             return
-        pts_norm = self.canvas.current # These are already normalized QPointF
+        pts_norm = self._active_points_for_zone()
         if len(pts_norm) < 3:
             QMessageBox.warning(self, "Error", "Polygon must have at least 3 points")
+            self._set_status("Polygon must have at least 3 points", is_error=True)
             return
-        # basic validation: points inside image rect
-        w = self.canvas.width()
-        h = self.canvas.height()
+
         for p in pts_norm:
             if not (0.0 <= p.x() <= 1.0 and 0.0 <= p.y() <= 1.0):
                 QMessageBox.warning(self, "Error", "Polygon points must be inside image bounds")
+                self._set_status("Polygon points must be inside image bounds", is_error=True)
                 return
+
         z = {
             "name": name,
             "type": self.zone_type.currentText(),
@@ -429,6 +535,7 @@ class ZoneEditorWidget(QWidget):
         }
         if self.current_camera is None:
             QMessageBox.warning(self, "Error", "No camera loaded")
+            self._set_status("No camera loaded", is_error=True)
             return
         
         # Check if editing an existing zone or creating a new one
@@ -438,32 +545,34 @@ class ZoneEditorWidget(QWidget):
 
         if can_edit:
             cam_zones[selected_row] = z
-            item = self.zone_list.item(selected_row)
-            if item:
-                item.setText(f"{name} ({z['type']})")
-            QMessageBox.information(self, "Updated", f"Zone '{name}' updated.")
+            status_message = f"Updated zone '{name}'"
+            target_row = selected_row
         else:
             cam_zones.append(z)
-            self.zone_list.addItem(QListWidgetItem(f"{name} ({z['type']})"))
-            QMessageBox.information(self, "Created", f"Zone '{name}' created.")
+            status_message = f"Created zone '{name}'"
+            target_row = len(cam_zones) - 1
 
-        self.canvas.polygons = [
-            [QPointF(p[0], p[1]) for p in zone['points']]
-            for zone in cam_zones
-        ]
+        self._refresh_zone_list_ui(self.current_camera)
+        self.zone_list.setCurrentRow(target_row)
+        self._refresh_canvas_polygons()
         self.canvas.clear_current()
+        self.canvas.last_finished = []
         self.canvas.update()
+        self._set_status(status_message)
+
         # optional overlap check
         if self._check_overlap(self.current_camera, z):
             QMessageBox.warning(self, "Warning", "Zone overlaps existing zone")
+            self._set_status("Warning: Zone overlaps existing zone", is_error=True)
 
     def save_zones(self):
         if not self.current_camera:
             QMessageBox.warning(self, "Error", "No camera selected/loaded")
+            self._set_status("No camera selected", is_error=True)
             return
         zones = self.zones.get(self.current_camera, [])
         if not zones:
-            QMessageBox.information(self, "Info", "No zones to save")
+            self._set_status("No zones to save", is_error=True)
             return
         zones_to_save = []
         for z in zones:
@@ -480,19 +589,26 @@ class ZoneEditorWidget(QWidget):
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(zones_to_save, f, indent=2, ensure_ascii=False)
-            QMessageBox.information(self, "Saved", f"Zones saved to {file_path}")
+            self._set_status(f"Saved {len(zones_to_save)} zone(s) to {file_path}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save zones: {e}")
+            self._set_status(f"Failed to save zones: {e}", is_error=True)
 
-    def load_zones(self):
+    def load_zones(self, show_notice: bool = True):
         cam = self.camera_selector.currentText()
         if not cam:
             QMessageBox.warning(self, "Error", "No camera selected")
+            self._set_status("No camera selected", is_error=True)
             return
+        self.current_camera = cam
         zones_dir = Path(self.config.get("paths", {}).get("zones", "data/zones"))
         file_path = zones_dir / f"zones_{cam}.json"
         if not file_path.exists():
-            QMessageBox.information(self, "Info", "No zones file for this camera")
+            self.zones[cam] = []
+            self._refresh_zone_list_ui(cam)
+            self._refresh_canvas_polygons()
+            if show_notice:
+                self._set_status(f"No zones file for {cam}")
             return
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -523,30 +639,34 @@ class ZoneEditorWidget(QWidget):
                 })
 
             self.zones[cam] = normalized_loaded
-            self.zone_list.clear()
-            for z in normalized_loaded:
-                self.zone_list.addItem(QListWidgetItem(f"{z.get('name','') } ({z.get('type','')})"))
+            self._refresh_zone_list_ui(cam)
             self._refresh_canvas_polygons()
-            QMessageBox.information(self, "Loaded", f"Loaded {len(loaded)} zones for {cam}")
+            if show_notice:
+                self._set_status(f"Loaded {len(loaded)} zone(s) for {cam}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load zones: {e}")
+            self._set_status(f"Failed to load zones: {e}", is_error=True)
 
     def delete_selected_zone(self):
         cam = self.current_camera or self.camera_selector.currentText()
         idx = self.zone_list.currentRow()
         if idx < 0:
-            QMessageBox.information(self, "Info", "No zone selected")
+            self._set_status("No zone selected", is_error=True)
             return
         if not cam or cam not in self.zones:
             QMessageBox.warning(self, "Error", "No zones loaded for this camera")
+            self._set_status("No zones loaded for this camera", is_error=True)
             return
         try:
+            zone_name = self.zones[cam][idx].get("name", f"#{idx+1}")
             del self.zones[cam][idx]
-            self.zone_list.takeItem(idx)
+            self._refresh_zone_list_ui(cam)
             self._refresh_canvas_polygons()
-            QMessageBox.information(self, "Deleted", "Zone deleted")
+            self.start_new_zone()
+            self._set_status(f"Deleted zone '{zone_name}'")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to delete zone: {e}")
+            self._set_status(f"Failed to delete zone: {e}", is_error=True)
 
     def on_zone_selected(self, row: int):
         """Load selected zone into form and canvas preview."""
@@ -564,21 +684,19 @@ class ZoneEditorWidget(QWidget):
             self.zone_type.setCurrentIndex(idx)
 
         self.canvas.current = [QPointF(p[0], p[1]) for p in zone.get("points", [])]
+        self.canvas.last_finished = list(self.canvas.current)
         self._refresh_canvas_polygons()
         self.canvas.update()
+        self._set_status(f"Editing zone '{zone.get('name', '')}'")
 
     def edit_selected_zone(self):
         """Prepare selected zone for editing by loading its points."""
         row = self.zone_list.currentRow()
         if row < 0:
-            QMessageBox.information(self, "Info", "No zone selected")
+            self._set_status("No zone selected", is_error=True)
             return
         self.on_zone_selected(row)
-        QMessageBox.information(
-            self,
-            "Edit Zone",
-            "Zone loaded to editor. Adjust points and click 'Create Zone from Current' to update."
-        )
+        self._set_status("Zone loaded. Move points and click Create / Update Zone")
 
     def _check_overlap(self, camera: str, new_zone: Dict) -> bool:
         """Check polygon overlap using segment intersection and point-in-polygon tests."""
@@ -651,3 +769,5 @@ class ZoneEditorWidget(QWidget):
             if len(z.get('points', [])) < 3:
                 return False, f"Zone {z.get('name','?')} has fewer than 3 points"
         return True, "OK"
+
+
