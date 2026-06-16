@@ -86,6 +86,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--device", default="auto", help="auto|cpu|mps|cuda")
     p.add_argument("--split", default="val", choices=["train", "val", "test"])
+    p.add_argument("--verbose", action="store_true", help="Verbose output with detailed metrics")
+    p.add_argument("--per-class", action="store_true", help="Include per-class metrics in output")
     return p.parse_args()
 
 
@@ -145,7 +147,7 @@ def main() -> None:
             imgsz=args.imgsz,
             batch=args.batch,
             device=device,
-            verbose=True,
+            verbose=args.verbose,
         )
     finally:
         if tmp_yaml_path is not None:
@@ -169,8 +171,44 @@ def main() -> None:
         "map50_pct": map50 * 100.0,
         "map50_95_pct": map50_95 * 100.0,
     }
+    
+    # Add per-class metrics if requested
+    if args.per_class and hasattr(results.box, 'ap_class_index'):
+        try:
+            # Get class-specific metrics
+            class_metrics = {}
+            if hasattr(results.box, 'ap_class_index') and hasattr(results.box, 'ap50'):
+                for i, class_index in enumerate(results.box.ap_class_index):
+                    class_name = cfg.get('names', {}).get(class_index, f'class_{class_index}')
+                    class_metrics[class_name] = {
+                        'ap50': float(results.box.ap50[i]),
+                        'ap50_95': float(results.box.ap[i]),
+                        'precision': float(results.box.p[i]),
+                        'recall': float(results.box.r[i]),
+                    }
+            metrics['per_class'] = class_metrics
+        except Exception as e:
+            print(f"Warning: Could not extract per-class metrics: {e}")
+    
     print(f"USING_WEIGHTS: {weights}")
     print("METRICS_JSON:", json.dumps(metrics, ensure_ascii=False))
+    
+    # Print detailed metrics if verbose
+    if args.verbose:
+        print("\nDetailed Metrics:")
+        print(f"  Precision: {metrics['precision_pct']:.2f}%")
+        print(f"  Recall: {metrics['recall_pct']:.2f}%")
+        print(f"  mAP@0.5: {metrics['map50_pct']:.2f}%")
+        print(f"  mAP@0.5:0.95: {metrics['map50_95_pct']:.2f}%")
+        
+        if args.per_class and 'per_class' in metrics:
+            print("\nPer-Class Metrics:")
+            for class_name, class_data in metrics['per_class'].items():
+                print(f"  {class_name}:")
+                print(f"    AP@0.5: {class_data['ap50']*100:.2f}%")
+                print(f"    AP@0.5:0.95: {class_data['ap50_95']*100:.2f}%")
+                print(f"    Precision: {class_data['precision']*100:.2f}%")
+                print(f"    Recall: {class_data['recall']*100:.2f}%")
 
 
 if __name__ == "__main__":
