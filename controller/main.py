@@ -51,6 +51,7 @@ from controller.staff_builder import StaffBuilderWidget
 from controller.live_viewer import LiveViewerWidget
 from controller.performance_widget import PerformanceWidget
 from controller.theme import apply_theme, SidebarTabWidget
+from controller.login import run_login_gate
 
 # =========================
 # SETUP
@@ -2797,6 +2798,8 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
 def main():
     app = QApplication(sys.argv)
     apply_theme(app)
+    if not run_login_gate(CONFIG):
+        sys.exit(0)
     controller = MainController()
     controller.show()
     sys.exit(app.exec())

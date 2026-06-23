@@ -160,7 +160,15 @@ class ModelOTA:
 def _load_yaml(path: Path) -> dict:
     import yaml
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        data = yaml.safe_load(f) or {}
+    # Decrypt machine-bound secrets (anon key / device_token) — this module reads
+    # the config raw instead of via Config, so do the same transparent decrypt.
+    try:
+        from shared.config import _decrypt_secrets
+        data = _decrypt_secrets(data)
+    except Exception:
+        pass
+    return data
 
 
 def main() -> int:

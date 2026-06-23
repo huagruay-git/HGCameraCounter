@@ -33,6 +33,7 @@ runtime/*.log
 data/config/config.yaml
 data/config/cloud_session.json
 data/config/salon_ai.runtime.yaml
+data/config/auth.json
 data/config/backups/
 
 # ===== Models (large binaries — use Git LFS or external storage) =====
