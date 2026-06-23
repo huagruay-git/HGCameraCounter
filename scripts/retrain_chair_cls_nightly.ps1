@@ -4,8 +4,13 @@
 # (models/chair_service_cls_clean.pt) — it does NOT overwrite the production model,
 # so the result must be validated before re-enabling the classifier.
 $ErrorActionPreference = 'Continue'
-$root = 'C:\Users\พีซี\code\HGCameraCounter'
-Set-Location $root
+# Derive root from the script's own location instead of a hardcoded non-ASCII path.
+# The literal Thai path ("พีซี") was mangled under the Task Scheduler code page, so
+# Set-Location failed and the script died before writing any log (the 2026-06-21 run
+# produced no log + no model despite LastResult=0). $PSScriptRoot is provided by the
+# engine as proper Unicode, so it survives the encoding mismatch.
+$root = Split-Path -Parent $PSScriptRoot
+Set-Location -LiteralPath $root
 $ts  = Get-Date -Format 'yyyyMMdd_HHmmss'
 $log = Join-Path $root "logs\retrain_chair_cls_$ts.log"
 "[$ts] starting clean chair-cls retrain" | Out-File -FilePath $log -Encoding utf8
