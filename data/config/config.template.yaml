@@ -30,24 +30,13 @@ updates:
 #     zones_file: "relative/path/to/zones_CameraName.json"
 #     note: "optional description"
 
-cameras:
-  Camera_01:
-    rtsp_url: "rtsp://<user>:<pass>@<camera-01-host>:554/ch01/0"
-    enabled: true
-    zones_file: "data/zones/zones_Camera_01.json"
-    note: "Main shop view"
-  
-  Camera_02:
-    rtsp_url: "rtsp://<user>:<pass>@<camera-02-host>:554/ch01/0"
-    enabled: true
-    zones_file: "data/zones/zones_Camera_02.json"
-    note: "Wash area"
-  
-  # Camera_03:
-  #   rtsp_url: "rtsp://..."
-  #   enabled: false
-  #   zones_file: "data/zones/zones_Camera_03.json"
-  #   note: "Backup camera"
+cameras: {}
+  # Add one block per real camera; name it by IP. Example:
+  # Camera_192_168_1_132:
+  #   rtsp_url: "rtsp://<user>:<pass>@192.168.1.132:554/ch01/0"
+  #   enabled: true
+  #   zones_file: "data/zones/zones_Camera_192_168_1_132.json"
+  #   note: "Main counting camera"
 
 # YOLO Detection Configuration
 yolo:

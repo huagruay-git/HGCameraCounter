@@ -196,18 +196,7 @@ class Config:
                 "url": os.getenv("SUPABASE_URL", ""),
                 "key": os.getenv("SUPABASE_ANON_KEY", ""),
             },
-            "cameras": {
-                "Camera_01": {
-                    "rtsp_url": os.getenv("CAM1_URL", ""),
-                    "enabled": True,
-                    "note": ""
-                },
-                "Camera_02": {
-                    "rtsp_url": os.getenv("CAM2_URL", ""),
-                    "enabled": True,
-                    "note": ""
-                }
-            },
+            "cameras": {},
             "yolo": {
                 "model": "best.pt",
                 "discovery_model": "yolov8n.pt",
