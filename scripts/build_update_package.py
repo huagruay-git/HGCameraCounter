@@ -88,12 +88,18 @@ def main() -> int:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         if args.onedir:
             # Package a built PyInstaller onedir (exe + _internal) for frozen self-update.
+            # Skip per-device state dirs — the self-update swap preserves those on the device.
             onedir = Path(args.onedir).resolve()
+            _skip = {"data", "models", "logs", "reports", "snapshots", "tools", "updates", "experiments"}
             for p in sorted(onedir.rglob("*")):
-                if p.is_file():
-                    zf.write(p, p.relative_to(onedir))
-                    total_files += 1
-            included.append(f"onedir:{onedir.name}")
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(onedir)
+                if (rel.parts and rel.parts[0] in _skip) or p.suffix.lower() == ".zip":
+                    continue
+                zf.write(p, rel)
+                total_files += 1
+            included.append(f"onedir:{onedir.name} (app only, {total_files} files)")
         else:
             for rel in CODE_UPDATE_PATHS:
                 src = ROOT / rel
