@@ -3,10 +3,19 @@ Centralized configuration management
 """
 
 import os
+import sys
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 import yaml
+
+
+def _app_base() -> Path:
+    """Base dir for relative paths: project root (source) or the exe folder (frozen)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
 
 try:
     from shared.secure import decrypt_secret, encrypt_secret, is_encrypted
@@ -54,7 +63,7 @@ class Config:
         """
         raw_path = Path(config_path or "data/config/config.yaml")
         if not raw_path.is_absolute():
-            raw_path = Path(__file__).resolve().parent.parent / raw_path
+            raw_path = _app_base() / raw_path
         self.config_path = str(raw_path)
         self.data: Dict[str, Any] = {}
         self.load()
@@ -288,7 +297,7 @@ class Config:
             }
         }
         try:
-            template_path = Path(__file__).resolve().parent.parent / "data" / "config" / "config.template.yaml"
+            template_path = _app_base() / "data" / "config" / "config.template.yaml"
             if template_path.exists():
                 tmpl = yaml.safe_load(template_path.read_text(encoding="utf-8")) or {}
                 if isinstance(tmpl, dict):

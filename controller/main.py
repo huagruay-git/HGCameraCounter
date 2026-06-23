@@ -1297,14 +1297,16 @@ class MainController(QMainWindow):
         """Return subprocess command to launch recorder."""
         root = self._project_root()
         if getattr(sys, "frozen", False):
-             # For frozen builds, similar logic to runtime_command (omitted for brevity)
-             # assuming same executable or explicit wrapper
-             pass
+            # Frozen: re-invoke this same exe in recorder mode (see packaging/launcher.py).
+            return [sys.executable, "--recorder"]
         return [sys.executable, "-u", str(root / "runtime" / "recorder.py")]
 
     def _processor_command(self) -> list[str]:
         """Return subprocess command to launch processor."""
         root = self._project_root()
+        if getattr(sys, "frozen", False):
+            # Frozen: re-invoke this same exe in runtime mode (see packaging/launcher.py).
+            return [sys.executable, "--runtime"]
         return [sys.executable, "-u", str(root / "runtime" / "processor.py")]
     
     def start_service(self):
@@ -1873,6 +1875,20 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
                     'preserved and the replaced code is backed up. The controller restarts afterward.',
                     QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
+                    if getattr(sys, 'frozen', False):
+                        # Frozen .exe: can't overwrite running files -> swap the whole
+                        # onedir install via an external helper, then relaunch.
+                        try:
+                            from shared.self_update import apply_frozen_update
+                            if self.is_running:
+                                self.stop_service()
+                            apply_frozen_update(chosen)
+                            QMessageBox.information(self, 'Updating',
+                                'The app will now close, update itself, and reopen automatically.')
+                            QTimer.singleShot(500, self.close)
+                        except Exception as e:
+                            QMessageBox.critical(self, 'Update Failed', f'Self-update failed: {e}')
+                        return
                     try:
                         updater = Updater(CONFIG.data if hasattr(CONFIG, 'data') else CONFIG)
                         root = self._project_root()

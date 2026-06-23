@@ -75,6 +75,8 @@ def main() -> int:
     ap.add_argument("--notes", default="")
     ap.add_argument("--base-url", default="", help="where the zip will be hosted")
     ap.add_argument("--out-dir", default="dist")
+    ap.add_argument("--onedir", default="",
+                    help="package a PyInstaller onedir folder (e.g. dist/HGCameraCounter) for .exe self-update")
     args = ap.parse_args()
 
     out = ROOT / args.out_dir
@@ -84,13 +86,22 @@ def main() -> int:
 
     included, total_files = [], 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for rel in CODE_UPDATE_PATHS:
-            src = ROOT / rel
-            if src.exists():
-                c = _add(zf, src, Path(rel))
-                if c:
-                    included.append(f"{rel}({c})")
-                    total_files += c
+        if args.onedir:
+            # Package a built PyInstaller onedir (exe + _internal) for frozen self-update.
+            onedir = Path(args.onedir).resolve()
+            for p in sorted(onedir.rglob("*")):
+                if p.is_file():
+                    zf.write(p, p.relative_to(onedir))
+                    total_files += 1
+            included.append(f"onedir:{onedir.name}")
+        else:
+            for rel in CODE_UPDATE_PATHS:
+                src = ROOT / rel
+                if src.exists():
+                    c = _add(zf, src, Path(rel))
+                    if c:
+                        included.append(f"{rel}({c})")
+                        total_files += c
 
     sha = _sha256(zip_path)
     base = args.base_url.rstrip("/")
@@ -98,6 +109,7 @@ def main() -> int:
     meta = {
         "version": args.version,
         "notes": args.notes,
+        "kind": "onedir" if args.onedir else "source",
         "assets": [{"name": zip_name, "url": url, "sha256": sha}],
     }
     meta_path = out / "update_metadata.json"
