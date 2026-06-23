@@ -5,6 +5,7 @@ __pycache__/
 .Python
 *.egg-info/
 *.spec
+!packaging/pyinstaller/hgcc.spec
 .pytest_cache/
 
 # ===== Virtual environments =====
