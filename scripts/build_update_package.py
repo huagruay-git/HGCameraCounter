@@ -35,6 +35,7 @@ EXCLUDE_EXT = {".pyc", ".pyo", ".log", ".cache", ".pt", ".onnx", ".tmp", ".bak"}
 EXCLUDE_NAMES = {
     "runtime_settings.override.json", "processor_sync_state.json",
     "chair_service_autotrain_state.json", "dashboard_state.json",
+    "watchdog_state.json",
 }
 
 

@@ -71,6 +71,7 @@ runtime/chair_service_autotrain_state.json
 runtime/dashboard_state.json
 runtime/dashboard_state*.tmp
 runtime/runtime_settings.override.json
+data/state/watchdog_state.json
 
 # ===== Third-party binaries =====
 tools/ffmpeg/

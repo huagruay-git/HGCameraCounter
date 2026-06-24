@@ -564,3 +564,37 @@ class CCTVSupabaseRPCClient:
         if not self.ensure_connected():
             raise RuntimeError("Supabase client is not connected")
         return self.client.storage.from_(bucket).download(path)
+
+    # ------------------------------------------------------------------
+    # Remote device commands (reboot/restart_app/shutdown/power_cycle/wake)
+    # Requires supabase/migrations/20260624_cctv_device_commands.sql
+    # ------------------------------------------------------------------
+    def get_cctv_device_commands(self, device_token: str) -> List[Dict[str, Any]]:
+        """Pull this device's pending commands; the server marks them 'acked'."""
+        data = self._rpc("get_cctv_device_commands", {
+            "p_device_token": (device_token or "").strip(),
+        })
+        if isinstance(data, list):
+            return [c for c in data if isinstance(c, dict)]
+        return []
+
+    def ack_cctv_device_command(self, device_token: str, command_id: str,
+                                status: str, detail: Optional[str] = None) -> Any:
+        """Report a command outcome ('done' or 'failed')."""
+        return self._rpc("ack_cctv_device_command", {
+            "p_device_token": (device_token or "").strip(),
+            "p_command_id": command_id,
+            "p_status": status,
+            "p_detail": detail,
+        })
+
+    def admin_enqueue_cctv_command(self, device_id: int, command: str,
+                                   args: Optional[Dict[str, Any]] = None,
+                                   expires_in_minutes: int = 60) -> Any:
+        """Queue a command for a device (authenticated caller only). Returns the command id."""
+        return self._rpc("admin_enqueue_cctv_command", {
+            "p_device_id": int(device_id),
+            "p_command": command,
+            "p_args": args or {},
+            "p_expires_in_minutes": int(expires_in_minutes),
+        })

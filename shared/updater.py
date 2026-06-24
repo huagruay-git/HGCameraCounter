@@ -58,6 +58,22 @@ def is_newer(latest, current) -> bool:
     return parse_version(latest) > parse_version(current)
 
 
+def read_version_file(root) -> Optional[str]:
+    """Installed app version from the top-level VERSION file (shipped in CODE_UPDATE_PATHS).
+
+    This is the authoritative current version: a code update overwrites VERSION, so the
+    device stops re-offering the same release (config.yaml `version` is never rewritten
+    by install_code_update, so it must NOT be the source of truth). Returns None if absent.
+    """
+    try:
+        p = Path(root) / "VERSION"
+        if p.exists():
+            return p.read_text(encoding="utf-8").strip() or None
+    except Exception:
+        pass
+    return None
+
+
 class Updater:
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}

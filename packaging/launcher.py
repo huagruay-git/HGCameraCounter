@@ -4,6 +4,7 @@ Single-executable entry point for the frozen (.exe) build.
   HGCameraCounter.exe              -> controller GUI (default)
   HGCameraCounter.exe --runtime    -> counting runtime (processor)
   HGCameraCounter.exe --recorder   -> clip recorder
+  HGCameraCounter.exe --watchdog   -> liveness watchdog (auto-reboot on freeze)
 
 The controller starts the runtime/recorder by re-invoking THIS same exe with the
 flag (see controller/main.py _processor_command/_recorder_command), so the heavy
@@ -37,7 +38,7 @@ if getattr(sys, "frozen", False):
 def main() -> None:
     argv = sys.argv[1:]
     # Strip our dispatch flags so the target module's own arg parsing isn't confused.
-    _modes = {"--runtime", "--recorder", "--model-ota"}
+    _modes = {"--runtime", "--recorder", "--model-ota", "--watchdog"}
     sys.argv = [sys.argv[0]] + [a for a in argv if a not in _modes]
     if "--runtime" in argv:
         runpy.run_module("runtime.processor", run_name="__main__")
@@ -46,6 +47,10 @@ def main() -> None:
     elif "--model-ota" in argv:
         # Pull model/config OTA from Supabase (run on a schedule on the device).
         runpy.run_module("runtime.model_ota", run_name="__main__")
+    elif "--watchdog" in argv:
+        # Liveness watchdog: reboot the PC if the counting runtime freezes/dies.
+        # Started at boot by Windows Task Scheduler (see scripts/install_watchdog_task.ps1).
+        runpy.run_module("runtime.watchdog", run_name="__main__")
     else:
         runpy.run_module("controller.main", run_name="__main__")
 

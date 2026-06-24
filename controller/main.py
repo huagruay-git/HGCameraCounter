@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from shared.config import Config
 from shared.logger import setup_logger
 from shared.dashboard_updater import init_dashboard_service, get_broadcaster
-from shared.updater import Updater, is_newer
+from shared.updater import Updater, is_newer, read_version_file
 from controller.setup_wizard import SetupWizard
 from controller.dashboard_client import GUIDashboardClient
 from controller.camera_manager import CameraManagerWidget
@@ -132,6 +132,47 @@ class FlexibleTabWidget(QTabWidget):
 
     def minimumSizeHint(self):
         return QSize(640, 360)
+
+
+class _UpdateWorker(QThread):
+    """Background OTA check (and optional download+verify) so the UI never blocks."""
+    done = Signal(dict)
+
+    def __init__(self, config_data, metadata_url, current_version, do_download):
+        super().__init__()
+        self._cfg = config_data
+        self._url = metadata_url
+        self._cur = current_version
+        self._dl = do_download
+
+    def run(self):
+        try:
+            upd = Updater(self._cfg)
+            meta = upd.check_for_update(self._url)
+            version, notes = upd.inspect_metadata_for_update(meta)
+            if not version or not is_newer(version, self._cur):
+                self.done.emit({"status": "uptodate", "version": version})
+                return
+            asset = upd.select_primary_asset(meta)
+            if not asset:
+                self.done.emit({"status": "error", "error": "no downloadable asset in metadata"})
+                return
+            if not self._dl:
+                self.done.emit({"status": "available", "version": version, "notes": notes})
+                return
+            path = upd.download_asset(asset.get("url"), name=asset.get("name"))
+            sha = asset.get("sha256") or asset.get("sha") or asset.get("checksum")
+            if sha and not upd.verify_sha256(path, sha):
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self.done.emit({"status": "error", "error": "sha256 mismatch (download rejected)"})
+                return
+            staged = upd.stage_update(path)
+            self.done.emit({"status": "ready", "version": version, "notes": notes, "path": str(staged)})
+        except Exception as e:
+            self.done.emit({"status": "error", "error": str(e)})
 
 
 class MainController(QMainWindow):
@@ -239,6 +280,11 @@ class MainController(QMainWindow):
         self.install_update_btn.setToolTip("Run a staged installer from updates/")
         self.install_update_btn.clicked.connect(self.install_update)
         header_layout.addWidget(self.install_update_btn)
+        # Update settings (URL + auto-update toggles)
+        self.update_settings_btn = QPushButton("Update Settings")
+        self.update_settings_btn.setToolTip("Set the update URL and turn auto-update on/off")
+        self.update_settings_btn.clicked.connect(self.open_update_settings)
+        header_layout.addWidget(self.update_settings_btn)
         
         layout.addLayout(header_layout)
         
@@ -272,9 +318,13 @@ class MainController(QMainWindow):
         layout.addWidget(self.tabs)
         
         central_widget.setLayout(layout)
-        
+
         # Status bar
         self.statusBar().showMessage("Ready")
+
+        # Optional silent auto-check for updates shortly after launch (opt-in via config).
+        self._update_worker = None
+        QTimer.singleShot(4000, self._auto_check_on_startup)
     
     def _kpi_card(self, title: str, attr: str) -> QFrame:
         frame = QFrame()
@@ -1790,6 +1840,120 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             QMessageBox.warning(self, 'Restart needed',
                                 f'Update applied, but auto-restart failed. Please restart manually.\n{e}')
 
+    def _updates_cfg(self) -> dict:
+        cfg = CONFIG.get('updates', {})
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _current_version(self) -> str:
+        return read_version_file(self._project_root()) or str(CONFIG.get('version', '0') or '0')
+
+    def open_update_settings(self):
+        """Persistent GUI for the update URL + auto-update behavior (saved to config)."""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox
+        cfg = self._updates_cfg()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Update Settings")
+        dlg.setMinimumWidth(640)
+        form = QFormLayout(dlg)
+
+        url_edit = QLineEdit(str(cfg.get('metadata_url', '') or ''))
+        url_edit.setPlaceholderText(
+            "https://<proj>.supabase.co/storage/v1/object/public/app-updates/update_metadata.json")
+        form.addRow("Update URL (metadata JSON):", url_edit)
+
+        startup_chk = QCheckBox("Check for updates automatically on startup")
+        startup_chk.setChecked(bool(cfg.get('auto_check_on_startup', False)))
+        form.addRow(startup_chk)
+
+        auto_chk = QCheckBox("Install updates automatically — no prompt, app restarts")
+        auto_chk.setChecked(bool(cfg.get('auto_install', False)))
+        form.addRow(auto_chk)
+
+        info = QLabel(f"Current version: {self._current_version()}")
+        info.setStyleSheet("color:#6B6B64;")
+        form.addRow(info)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_cfg = dict(cfg)
+        new_cfg['metadata_url'] = url_edit.text().strip()
+        new_cfg['auto_check_on_startup'] = startup_chk.isChecked()
+        new_cfg['auto_install'] = auto_chk.isChecked()
+        new_cfg.setdefault('download_dir', cfg.get('download_dir', 'updates'))
+        try:
+            CONFIG['updates'] = new_cfg
+            CONFIG.save()
+            QMessageBox.information(self, "Update Settings", "Saved.")
+        except Exception as e:
+            QMessageBox.critical(self, "Update Settings", f"Could not save settings: {e}")
+
+    def _auto_check_on_startup(self):
+        cfg = self._updates_cfg()
+        if not cfg.get('auto_check_on_startup'):
+            return
+        if not str(cfg.get('metadata_url', '') or '').strip():
+            return
+        self._start_update_worker(do_download=bool(cfg.get('auto_install', False)))
+
+    def _start_update_worker(self, do_download: bool):
+        if getattr(self, '_update_worker', None) is not None and self._update_worker.isRunning():
+            return
+        url = str(self._updates_cfg().get('metadata_url', '') or '').strip()
+        if not url:
+            return
+        self.statusBar().showMessage("Checking for updates...")
+        cfg_data = CONFIG.data if hasattr(CONFIG, 'data') else CONFIG
+        self._update_worker = _UpdateWorker(cfg_data, url, self._current_version(), do_download)
+        self._update_worker.done.connect(self._on_update_worker_done)
+        self._update_worker.start()
+
+    def _on_update_worker_done(self, result: dict):
+        status = result.get('status')
+        if status == 'uptodate':
+            self.statusBar().showMessage(f"Up to date (v{self._current_version()})", 5000)
+            return
+        if status == 'error':
+            self.statusBar().showMessage(f"Update check failed: {result.get('error')}", 8000)
+            return
+        if status == 'available':
+            v = result.get('version')
+            self.statusBar().showMessage(f"Update v{v} available — click 'Install Update'", 0)
+            QMessageBox.information(
+                self, "Update available",
+                f"Version {v} is available.\n{result.get('notes') or ''}\n\n"
+                "Click 'Check Updates' then 'Install Update' to apply, "
+                "or enable auto-install in Update Settings.")
+            return
+        if status == 'ready':
+            v = result.get('version')
+            self.statusBar().showMessage(f"Installing update v{v}...", 0)
+            self._auto_apply_update(Path(result.get('path')), v)
+
+    def _auto_apply_update(self, archive_path: Path, version):
+        """Apply an already downloaded+verified update archive, then restart."""
+        try:
+            if getattr(self, 'is_running', False):
+                self.stop_service()
+            if getattr(sys, 'frozen', False):
+                from shared.self_update import apply_frozen_update
+                apply_frozen_update(archive_path)
+                QMessageBox.information(self, "Updating",
+                    f"Updating to v{version}. The app will close, update, and reopen.")
+                QTimer.singleShot(500, self.close)
+                return
+            updater = Updater(CONFIG.data if hasattr(CONFIG, 'data') else CONFIG)
+            updater.install_code_update(archive_path, project_root=self._project_root(), version=str(version))
+            logger.info(f"Auto-update v{version} applied; relaunching")
+            self._relaunch_app()
+        except Exception as e:
+            logger.error(f"Auto-update failed: {e}")
+            self.statusBar().showMessage(f"Auto-update failed: {e}", 8000)
+
     def check_updates(self):
         """Check remote metadata, download & verify primary asset, and stage it under `updates/`.
 
@@ -1809,7 +1973,7 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             self.statusBar().showMessage('Checking for updates...')
             metadata = updater.check_for_update(metadata_url)
             version, notes = updater.inspect_metadata_for_update(metadata)
-            current_version = str(CONFIG.get('version', '0') or '0')
+            current_version = read_version_file(self._project_root()) or str(CONFIG.get('version', '0') or '0')
             if version and not is_newer(version, current_version):
                 QMessageBox.information(self, 'Up to date',
                     f'Already on the latest version (current {current_version}, latest {version}).')

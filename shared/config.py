@@ -190,7 +190,7 @@ class Config:
         """Get default configuration"""
         defaults = {
             "project_name": "HG Camera Counter",
-            "version": "0.1.0",
+            "version": "0.2.0",
             "branch_code": os.getenv("BRANCH_CODE", "DEMO"),
             "supabase": {
                 "url": os.getenv("SUPABASE_URL", ""),
@@ -283,7 +283,24 @@ class Config:
                 "reports": "reports",
                 "snapshots": "snapshots",
                 "logs": "logs",
-            }
+            },
+            "watchdog": {
+                "enabled": False,
+                "check_interval_sec": 30.0,
+                "liveness_file": "",
+                "stale_after_sec": 300.0,
+                "boot_grace_sec": 180.0,
+                "reboot_on_missing_file": False,
+                "require_seen_alive": True,
+                "consecutive_stale_required": 2,
+                "min_seconds_between_reboots": 900.0,
+                "max_reboots_per_day": 5,
+                "active_hours": "",
+                "reboot_delay_sec": 30,
+                "reboot_message": "HGCC watchdog: counting runtime unresponsive - auto restart",
+                "dry_run": False,
+                "state_file": "data/state/watchdog_state.json",
+            },
         }
         try:
             template_path = _app_base() / "data" / "config" / "config.template.yaml"
