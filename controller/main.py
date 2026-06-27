@@ -330,6 +330,12 @@ class MainController(QMainWindow):
         # PC resumes unattended after a reboot/power cut. Enabled by --autostart at boot
         # (HGCC_AUTOSTART=1) or the persistent `auto_start_service` config flag.
         QTimer.singleShot(7000, self._auto_start_service_on_boot)
+
+        # Re-check for updates periodically (default every 24h) so a PC left running for
+        # days still picks up new releases without a manual restart. The startup check
+        # above covers fresh launches; this covers long-running sessions. 0h disables it.
+        self._update_check_timer = None
+        self._setup_periodic_update_check()
     
     def _kpi_card(self, title: str, attr: str) -> QFrame:
         frame = QFrame()
@@ -1903,6 +1909,35 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             return
         if not str(cfg.get('metadata_url', '') or '').strip():
             return
+        self._start_update_worker(do_download=bool(cfg.get('auto_install', False)))
+
+    def _setup_periodic_update_check(self):
+        """Start a repeating timer that re-checks for updates every N hours.
+
+        Controlled by `updates.check_interval_hours` (default 24). Independent of the
+        startup check; set to 0 to disable periodic checks. Needs a metadata_url. When
+        auto_install is on, a found update downloads + applies + restarts the app.
+        """
+        cfg = self._updates_cfg()
+        try:
+            hours = float(cfg.get('check_interval_hours', 24) or 0)
+        except (TypeError, ValueError):
+            hours = 24.0
+        if hours <= 0:
+            logger.info("Periodic update check disabled (check_interval_hours<=0)")
+            return
+        if not str(cfg.get('metadata_url', '') or '').strip():
+            return
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.timeout.connect(self._periodic_update_check)
+        self._update_check_timer.start(int(hours * 3600 * 1000))
+        logger.info("Periodic update check scheduled every %.1fh", hours)
+
+    def _periodic_update_check(self):
+        cfg = self._updates_cfg()
+        if not str(cfg.get('metadata_url', '') or '').strip():
+            return
+        logger.info("Periodic update check firing")
         self._start_update_worker(do_download=bool(cfg.get('auto_install', False)))
 
     def _auto_start_service_on_boot(self):

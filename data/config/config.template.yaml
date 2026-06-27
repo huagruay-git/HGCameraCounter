@@ -27,6 +27,7 @@ updates:
   download_dir: "updates"  # where staged downloads + backups are kept
   auto_install: false      # true = install a newer update automatically + restart (no prompt)
   auto_check_on_startup: false  # true = silently check for updates ~4s after launch
+  check_interval_hours: 24      # re-check every N hours while running (0 = only at startup)
 
 # Liveness watchdog (auto-reboot the PC if the counting runtime freezes/dies).
 # Separate process started at boot by Task Scheduler — see scripts/install_watchdog_task.ps1.
