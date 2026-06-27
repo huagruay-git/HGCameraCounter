@@ -60,11 +60,16 @@ git clone https://github.com/huagruay-git/HGCameraCounter.git C:\HGCameraCounter
 - คัดลอก `models\best.pt` จากเครื่องเดิมมาวางที่ `models\best.pt`
 - หรือ (เมื่อบริษัทอัปโมเดลขึ้น Supabase แล้ว) เปิดโปรแกรม → แท็บ **อัปเดตโมเดล** → เลือกเวอร์ชัน → ดาวน์โหลด
 
-**3.2 ตั้งค่า + จับคู่อุปกรณ์** — เปิดโปรแกรมครั้งแรก:
-```powershell
+**3.2 เปิดโปรแกรมครั้งแรก + ตั้ง PIN (สำคัญมาก — ห้ามข้าม)**
+
+> ⚠️ **ดับเบิลคลิกไอคอนครั้งแรกจะยังไม่เปิด!** เพราะไอคอนเป็นตัว autostart ที่ออกแบบให้ "ข้าม PIN" ได้ แต่เครื่องยังไม่ได้ตั้ง PIN มันจึงปิดเงียบเพื่อความปลอดภัย — **ต้องเปิดเองครั้งแรกเพื่อตั้ง PIN ก่อน 1 ครั้ง** หลังจากนั้นไอคอน (และการบูต) จะเปิดได้เอง
+
+เปิด **Command Prompt (CMD)** แล้วพิมพ์ทีละบรรทัด:
+```bat
+cd /d C:\HGCameraCounter
 .venv\Scripts\python.exe controller\main.py
 ```
-- ตั้ง **PIN** (ครั้งแรก — ผูกกับเครื่องนี้)
+- ตั้ง **PIN** (พิมพ์ 2 ครั้ง — ผูกกับเครื่องนี้) แล้วจำไว้ให้ดี
 - แท็บ **Cloud Sync**: จับคู่อุปกรณ์กับ HQ (ได้ device token) + ใส่ Supabase URL/key + `branch_code` ของสาขา
 - แท็บ **Cameras**: ใส่กล้อง (IP/RTSP) ของสาขานั้น
 
@@ -99,6 +104,7 @@ git clone https://github.com/huagruay-git/HGCameraCounter.git C:\HGCameraCounter
 ```
 
 ## แก้ปัญหาที่พบบ่อย
+- **กดไอคอนแล้วไม่เปิด / เงียบ (ครั้งแรกหลังติดตั้ง)** → ยังไม่ได้ตั้ง PIN; ไอคอน autostart จะยังไม่เปิดจนกว่าจะตั้ง PIN ครั้งแรก — เปิดด้วย `cd /d C:\HGCameraCounter` แล้ว `.venv\Scripts\python.exe controller\main.py` เพื่อตั้ง PIN ก่อน (ขั้น 3.2)
 - **setup.bat ลง Python ไม่ได้** → ติดตั้งเอง [Python 3.11](https://www.python.org/downloads/release/python-3119/) (ติ๊ก Add to PATH) แล้วรัน `setup.bat` ใหม่
 - **เปิดโปรแกรมแล้วค้างหน้า PIN ตอนบูต** → ปกติ; ตอน autostart จะข้าม PIN ให้เองถ้าเป็นเครื่องที่ตั้ง PIN+ผูกเครื่องไว้แล้ว (ขั้น 3.2)
 - **ปิด autostart** → `powershell -ExecutionPolicy Bypass -File scripts\install_autostart.ps1 -Uninstall`
