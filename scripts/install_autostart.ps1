@@ -37,13 +37,15 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $startup = [Environment]::GetFolderPath('Startup')
 $linkPath = Join-Path $startup 'HG Camera Counter.lnk'
+$desktop = [Environment]::GetFolderPath('Desktop')
+$desktopLink = Join-Path $desktop 'HG Camera Counter.lnk'
 
 if ($Uninstall) {
-    if (Test-Path $linkPath) {
-        Remove-Item $linkPath -Force
-        Write-Host "Removed auto-start shortcut: $linkPath" -ForegroundColor Green
-    } else {
-        Write-Host "No auto-start shortcut found at: $linkPath" -ForegroundColor Yellow
+    foreach ($lp in @($linkPath, $desktopLink)) {
+        if (Test-Path $lp) {
+            Remove-Item $lp -Force
+            Write-Host "Removed shortcut: $lp" -ForegroundColor Green
+        }
     }
     return
 }
@@ -71,7 +73,19 @@ $appIcon = Join-Path $root 'assets\app_icon.ico'
 if (Test-Path $appIcon) { $sc.IconLocation = "$appIcon,0" } else { $sc.IconLocation = "$pyExe,0" }
 $sc.Save()
 
-Write-Host "Installed auto-start shortcut:" -ForegroundColor Green
+# Desktop shortcut too, so the operator has an obvious icon to double-click (first click
+# shows the PIN setup; later clicks/boots skip the PIN on this machine-bound device).
+$dsc = $shell.CreateShortcut($desktopLink)
+$dsc.TargetPath       = $pyExe
+$dsc.Arguments        = 'controller\main.py --autostart'
+$dsc.WorkingDirectory = $root
+$dsc.WindowStyle      = 1
+$dsc.Description      = 'HG Camera Counter'
+if (Test-Path $appIcon) { $dsc.IconLocation = "$appIcon,0" } else { $dsc.IconLocation = "$pyExe,0" }
+$dsc.Save()
+
+Write-Host "Installed shortcuts (Startup + Desktop):" -ForegroundColor Green
+Write-Host "  Desktop  : $desktopLink"
 Write-Host "  Shortcut : $linkPath"
 Write-Host "  Runs     : `"$pyExe`" controller\main.py --autostart"
 Write-Host "  StartIn  : $root"

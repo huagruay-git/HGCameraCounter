@@ -100,12 +100,13 @@ def run_login_gate(config=None) -> bool:
     except Exception:
         pass
 
-    # First run -> create PIN + bind machine. Autostart cannot do interactive setup;
-    # require a human to provision the device once before unattended boots will work.
+    # First run -> create PIN + bind machine. We show this even on an --autostart launch
+    # so the operator can just double-click the icon on a brand-new PC and set the PIN
+    # (no command line needed). It's a one-time, human-present step; once the PIN exists,
+    # later autostart boots skip it (see below).
     if not auth.get("pin_hash"):
         if autostart:
-            print("[login] autostart: no PIN set yet — run once manually to set the PIN. Refusing unattended start.")
-            return False
+            print("[login] autostart: no PIN yet — showing first-run PIN setup.")
         return _first_run_setup() is not None
 
     # Device binding: reject an auth file copied from another machine (always enforced).
