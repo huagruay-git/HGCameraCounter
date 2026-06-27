@@ -1,42 +1,73 @@
 # Windows EXE / Installer Guide
 
-## Prerequisites (Windows machine)
-- Python 3.11 (same major/minor as project)
-- Inno Setup 6 (for `Setup.exe`)
-- Repo source code
+The app ships as a **single executable** (`HGCameraCounter.exe`) that runs three modes
+from one bundle (so torch/ultralytics ship once):
 
-## 1) Create virtual environment
-```bat
-py -3.11 -m venv .venv
-.venv\Scripts\python -m pip install --upgrade pip setuptools wheel
-.venv\Scripts\pip install -r requirements.txt
-```
+| Command | Mode |
+|---------|------|
+| `HGCameraCounter.exe` | Controller GUI (default) — shows the PIN login gate |
+| `HGCameraCounter.exe --runtime` | Counting runtime (processor) — spawned by the GUI |
+| `HGCameraCounter.exe --recorder` | Clip recorder — spawned by the GUI |
+| `HGCameraCounter.exe --model-ota` | Pull model/config OTA from Supabase (run on a schedule) |
 
-## 2) Build EXE files (PyInstaller)
+## Prerequisites (Windows build machine)
+- Python 3.11 (the project venv: `.venv\Scripts\python.exe`)
+- Inno Setup 6 (for `Setup.exe`) — optional
+- The trained models in `models\` and `tools\ffmpeg\` present
+
+## 1) Build the EXE (PyInstaller)
 ```bat
 packaging\windows\build_exe.bat
 ```
+Output: `dist\HGCameraCounter\` (onedir) — `HGCameraCounter.exe` (~48 MB code) +
+`_internal\` (torch/ultralytics/PySide6, ~900 MB total).
 
-Expected output:
-- `dist\HGCameraCounter\HGCameraCounter.exe`
-- `dist\HGCameraCounter\runtime_service.exe` (copied automatically)
-- `dist\runtime_service\runtime_service.exe`
+The build is driven by `packaging\pyinstaller\hgcc.spec` (entry `packaging\launcher.py`).
 
-## 3) Build Setup.exe (Inno Setup)
+## 2) Build Setup.exe (Inno Setup) — optional
 ```bat
 iscc packaging\windows\HGCameraCounter.iss
 ```
+Output: `dist\installer\HGCameraCounter_Setup.exe`. Installs to `%LOCALAPPDATA%\HGCameraCounter`
+(user scope — no admin needed; logs/reports/config are writable there).
 
-Expected output:
-- `dist\installer\HGCameraCounter_Setup.exe`
+## Install layout (next to the exe)
+```
+HGCameraCounter\
+  HGCameraCounter.exe
+  _internal\                      ← bundled deps (do not edit)
+  models\*.pt                     ← YOLO + chair-service models
+  tools\ffmpeg\...\bin\ffmpeg.exe ← camera capture
+  data\config\config.yaml         ← PER-DEVICE (see provisioning) — NOT in the installer
+  data\zones\                     ← per-camera zones
+  logs\ reports\ snapshots\       ← created at runtime
+```
+The frozen app resolves these relative to the exe folder (see `_app_base()` in
+`shared/config.py` and `_project_root()` in `controller/main.py`).
 
-## Runtime layout requirement
-`runtime_service.exe` must stay next to `HGCameraCounter.exe` in install folder.
-Controller will auto-launch runtime executable from the same directory.
+## Per-device provisioning (important — security)
+`config.yaml` holds the Supabase anon key + `device_token`, which are **DPAPI-encrypted
+and machine-bound** (see `shared/secure.py`). A config from one machine **cannot be
+decrypted on another**, so the installer ships only `config.template.yaml`. On each
+device:
+1. Put the device's `config.yaml` in `…\HGCameraCounter\data\config\` (with its
+   own `device_token` from the CCTV enrollment / `register_cctv_device`).
+2. Run once to encrypt the secrets at rest:
+   `HGCameraCounter.exe` is GUI-only, so encrypt with the venv on the build machine
+   before copying, or ship a small `--encrypt-config` helper. (Currently:
+   `python scripts/encrypt_config_secrets.py` on a machine with the venv.)
+3. First launch asks the operator to set the **login PIN** (binds the app to that PC).
+
+## Updating a deployed .exe (OTA)
+- **App/code update** — host a new onedir package (`build_update_package.py --onedir dist\HGCameraCounter`)
+  + metadata, then the GUI's **Install Update** swaps the whole install via an external
+  helper (`shared/self_update.py`) and relaunches. Source (.py) installs use the
+  loose-file `install_code_update` path instead.
+- **Model/config update** — `HGCameraCounter.exe --model-ota` (schedule it) pulls the
+  branch's active model + config from Supabase (device-token RPC), verifies sha256, swaps
+  the model file, and hot-applies config. Works on the frozen .exe because models/config
+  live next to the exe, not inside it.
 
 ## Notes
-- Default install path is user scope:
-  - `%LOCALAPPDATA%\HGCameraCounter`
-- This avoids permission issues for logs/reports/snapshots/config writes.
-- If your Supabase table is `vision_events`, set in `data/config/config.yaml`:
-  - `supabase.events_table: vision_events`
+- The console window is on while validating; set `console=False` in `hgcc.spec` for a
+  windowless release build.

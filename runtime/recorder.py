@@ -25,6 +25,12 @@ from shared.ffmpeg_manager import find_ffmpeg_binary, ensure_ffmpeg_available
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BUSINESS_ZONE_PREFIXES = ("CHAIR", "WASH", "WAIT")
 
+# Hide the ffmpeg console window on Windows. At boot the app auto-starts under
+# pythonw.exe (no console), so every ffmpeg child would otherwise pop its own console
+# window — a flashing cmd box per recorded clip. The flag is Windows-only; getattr
+# yields 0 on POSIX, where it is a harmless no-op.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def _cfg_bool(v, default=False) -> bool:
     if v is None:
@@ -380,6 +386,7 @@ class RTSPRecorder:
                 stdout=self.log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                creationflags=_NO_WINDOW,
             )
             self.logger.info(f"Continuous recorder started: {self.camera_name}")
         except Exception as e:
@@ -416,6 +423,7 @@ class RTSPRecorder:
                     stdout=self.log_handle,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
+                    creationflags=_NO_WINDOW,
                 )
                 self.process = proc
                 proc.wait(timeout=self.clip_ffmpeg_timeout_sec)

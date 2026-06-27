@@ -36,6 +36,44 @@ from typing import Dict, Optional, Tuple
 from shared.logger import setup_logger
 
 
+# Code paths an OTA update is allowed to replace. Everything else on the device
+# (.venv, data/, models/, logs/, reports/, snapshots/, config) is preserved.
+CODE_UPDATE_PATHS = [
+    "controller", "runtime", "shared", "services", "detectors",
+    "tracking", "app", "ui", "scripts", "requirements.txt", "VERSION",
+]
+
+
+def parse_version(text) -> tuple:
+    """Parse 'v1.2.3' / '1.2.3' -> (1, 2, 3). Non-numeric chunks become 0."""
+    parts = []
+    for chunk in str(text or "0").strip().lstrip("vV").split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) if parts else (0,)
+
+
+def is_newer(latest, current) -> bool:
+    """True if `latest` version string is strictly newer than `current`."""
+    return parse_version(latest) > parse_version(current)
+
+
+def read_version_file(root) -> Optional[str]:
+    """Installed app version from the top-level VERSION file (shipped in CODE_UPDATE_PATHS).
+
+    This is the authoritative current version: a code update overwrites VERSION, so the
+    device stops re-offering the same release (config.yaml `version` is never rewritten
+    by install_code_update, so it must NOT be the source of truth). Returns None if absent.
+    """
+    try:
+        p = Path(root) / "VERSION"
+        if p.exists():
+            return p.read_text(encoding="utf-8").strip() or None
+    except Exception:
+        pass
+    return None
+
+
 class Updater:
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
@@ -177,6 +215,84 @@ class Updater:
     def inspect_metadata_for_update(self, metadata: Dict) -> Tuple[Optional[str], Optional[str]]:
         """Return (version, notes) if present"""
         return (metadata.get('version'), metadata.get('notes'))
+
+    def _find_code_root(self, staging: Path) -> Path:
+        """Locate the code root inside an extracted archive.
+
+        Handles archives that wrap everything in a single top-level folder.
+        """
+        for marker in ("controller", "requirements.txt", "VERSION"):
+            if (staging / marker).exists():
+                return staging
+        entries = list(staging.iterdir())
+        subdirs = [p for p in entries if p.is_dir()]
+        if len(subdirs) == 1 and not any(p.is_file() for p in entries):
+            return subdirs[0]
+        return staging
+
+    def install_code_update(self, archive_path: Path, project_root: Path,
+                            version: Optional[str] = None) -> Dict:
+        """Safely apply a code-only update.
+
+        Copies ONLY whitelisted code paths (CODE_UPDATE_PATHS) from the archive
+        over the install, backing up the replaced files first. The running venv,
+        data/, models/, logs/, reports/ and local config are never touched, so the
+        deploy cannot wipe data or move locked files (the failure mode of the old
+        install_update_atomic on Windows). Returns {copied, backup, version}.
+        """
+        archive_path = Path(archive_path)
+        project_root = Path(project_root).resolve()
+        if not archive_path.exists():
+            raise FileNotFoundError(archive_path)
+
+        now = int(time.time())
+        staging = self.download_dir / f"staging_{now}"
+        backup = self.download_dir / "backup" / f"{version or now}"
+        self.extract_archive(archive_path, staging)
+        src_root = self._find_code_root(staging)
+
+        copied, backed_up = [], []
+        try:
+            for rel in CODE_UPDATE_PATHS:
+                src = src_root / rel
+                if not src.exists():
+                    continue
+                dst = project_root / rel
+                if dst.exists():
+                    bdst = backup / rel
+                    bdst.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.is_dir():
+                        shutil.copytree(dst, bdst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(dst, bdst)
+                    backed_up.append(rel)
+                if src.is_dir():
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                else:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                copied.append(rel)
+            self.logger.info(
+                f"Code update applied: copied={copied} backup={backup if backed_up else 'none'}"
+            )
+            return {"copied": copied, "backup": str(backup) if backed_up else None,
+                    "version": version}
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def rollback_code_update(self, project_root: Path, backup_dir: Path) -> None:
+        """Restore code paths from a backup created by install_code_update."""
+        project_root = Path(project_root).resolve()
+        backup_dir = Path(backup_dir)
+        if not backup_dir.exists():
+            raise FileNotFoundError(backup_dir)
+        for item in backup_dir.iterdir():
+            dst = project_root / item.name
+            if item.is_dir():
+                shutil.copytree(item, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dst)
+        self.logger.info(f"Rolled back code from {backup_dir}")
 
     # Note: deliberate omission of auto-install to avoid overwriting runtime files without
     # explicit operator action. Implementers can add `install_update(path)` for platform-specific

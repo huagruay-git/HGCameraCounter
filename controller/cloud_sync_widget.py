@@ -41,10 +41,12 @@ class CloudSyncWidget(QWidget):
 
     log_signal = Signal(str)
     status_signal = Signal(str, str)
+    command_signal = Signal(dict)  # remote command -> executed on the main thread
 
     def __init__(self, host: Any):
         super().__init__()
         self.host = host
+        self.command_signal.connect(self._execute_command)
         self.client: Optional[CCTVSupabaseRPCClient] = None
         self.client_lock = threading.Lock()
         self.task_lock = threading.Lock()
@@ -434,6 +436,11 @@ class CloudSyncWidget(QWidget):
         if self.sync_daily_check.isChecked() and self._should_send_daily_now():
             self._launch_task("daily", self._send_daily_once)
 
+        # Poll for remote commands (reboot/restart/etc.) on the heartbeat cadence (min 15s).
+        if now_ts >= getattr(self, "next_command_at", 0.0):
+            self.next_command_at = now_ts + max(15.0, float(self.heartbeat_interval_spin.value()))
+            self._launch_task("commands", self._poll_commands_once, require_token=True)
+
     def _should_send_daily_now(self) -> bool:
         now_local = self._now_in_business_tz()
         business_date = now_local.strftime("%Y-%m-%d")
@@ -734,6 +741,71 @@ class CloudSyncWidget(QWidget):
             if not self.client.ensure_connected():
                 raise RuntimeError("Cannot connect to Supabase (check URL/Key).")
             return self.client
+
+    def _poll_commands_once(self):
+        """Pull pending remote commands (runs in a worker thread) and marshal each to
+        the main thread for execution."""
+        client = self._require_client()
+        token = self.device_token_input.text().strip()
+        if not token:
+            return
+        cmds = client.get_cctv_device_commands(token)
+        if cmds:
+            self.log_signal.emit(f"Remote command(s) received: {len(cmds)}")
+        for cmd in cmds:
+            self.command_signal.emit(cmd)
+
+    def _execute_command(self, cmd: dict):
+        """Execute one remote command on the main thread, then ack the outcome."""
+        import subprocess
+        import urllib.request
+        token = self.device_token_input.text().strip()
+        cmd_id = cmd.get("id")
+        name = str(cmd.get("command", "")).strip().lower()
+        args = cmd.get("args") if isinstance(cmd.get("args"), dict) else {}
+
+        def ack(status: str, detail: str):
+            try:
+                self._require_client().ack_cctv_device_command(token, cmd_id, status, detail)
+            except Exception as e:
+                self.log_signal.emit(f"ack failed: {e}")
+
+        self.log_signal.emit(f"Executing remote command: {name} ({cmd_id})")
+        try:
+            if name in ("reboot", "restart_pc"):
+                delay = int(args.get("delay_sec", 15))
+                ack("done", f"rebooting in {delay}s")
+                subprocess.Popen(["shutdown", "/r", "/f", "/t", str(delay), "/c", "HGCC remote reboot"])
+            elif name == "shutdown":
+                delay = int(args.get("delay_sec", 15))
+                ack("done", f"shutting down in {delay}s")
+                subprocess.Popen(["shutdown", "/s", "/f", "/t", str(delay), "/c", "HGCC remote shutdown"])
+            elif name == "restart_app":
+                ack("done", "restarting app")
+                if hasattr(self.host, "_relaunch_app"):
+                    self.host._relaunch_app()
+                else:
+                    self.log_signal.emit("restart_app: relauncher unavailable")
+            elif name in ("power_cycle", "wake"):
+                # Drive a smart-plug / WOL helper via an HTTP URL carried in args.url
+                # (e.g. a Shelly/Tasmota local endpoint). A fully-off PC cannot run this.
+                url = str(args.get("url", "") or "").strip()
+                if not url:
+                    ack("failed", "no plug url in args (e.g. {\"url\":\"http://<plug-ip>/relay/0?turn=off\"})")
+                else:
+                    urllib.request.urlopen(url, timeout=10)
+                    ack("done", f"plug/WOL triggered: {url[:48]}")
+            elif name == "update_now":
+                ack("done", "update check triggered")
+                if hasattr(self.host, "_start_update_worker"):
+                    self.host._start_update_worker(do_download=True)
+            elif name == "ping":
+                ack("done", "pong")
+            else:
+                ack("failed", f"unknown command: {name}")
+        except Exception as e:
+            self.log_signal.emit(f"command '{name}' failed: {e}")
+            ack("failed", str(e))
 
     def _launch_task(self, name: str, fn, require_token: bool = True):
         with self.task_lock:

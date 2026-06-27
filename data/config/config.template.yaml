@@ -4,13 +4,59 @@
 # Or set environment variables: SUPABASE_URL, SUPABASE_ANON_KEY, BRANCH_CODE
 
 project_name: "HG Camera Counter"
-version: "0.1.0"
+version: "0.2.0"
 branch_code: "${BRANCH_CODE:DEMO}"  # Or set BRANCH_CODE env var
+
+# Unattended boot recovery: start counting automatically when the dashboard opens.
+# Pair with the Startup-folder shortcut (scripts/install_autostart.ps1) which passes
+# --autostart so the PIN is skipped on this (machine-bound) device after a power cut.
+auto_start_service: false
 
 # Supabase Configuration
 supabase:
   url: "${SUPABASE_URL:}"           # Or set SUPABASE_URL env var
   key: "${SUPABASE_ANON_KEY:}"      # Or set SUPABASE_ANON_KEY env var
+
+# OTA software update (app code). Optional.
+# "Check Updates" fetches metadata_url, compares it to `version` above, and only
+# offers an update when the remote version is newer. "Install Update" applies a
+# CODE-ONLY update (venv/data/models/config are preserved and the replaced code is
+# backed up under download_dir/backup), then restarts the controller.
+updates:
+  metadata_url: ""         # HTTPS URL to release metadata JSON (see shared/updater.py docstring)
+  download_dir: "updates"  # where staged downloads + backups are kept
+  auto_install: false      # true = install a newer update automatically + restart (no prompt)
+  auto_check_on_startup: false  # true = silently check for updates ~4s after launch
+  check_interval_hours: 24      # re-check every N hours while running (0 = only at startup)
+
+# AI model updates: the "อัปเดตโมเดล" tab lists model versions from a PUBLIC manifest
+# and downloads+applies the one you pick (replaces yolo.worker_model/model). The company
+# publishes versions with scripts/upload_model.py. The new model applies on next Start.
+models:
+  manifest_url: ""  # HTTPS URL to models_manifest.json in a public bucket (empty = off)
+
+# Liveness watchdog (auto-reboot the PC if the counting runtime freezes/dies).
+# Separate process started at boot by Task Scheduler — see scripts/install_watchdog_task.ps1.
+# It watches runtime/dashboard_state.json (refreshed <=10s while the live agent is
+# alive) and runs `shutdown /r /f` when it goes stale. Test safely with:
+#   python runtime/watchdog.py --check            # show liveness age + decision
+#   python runtime/watchdog.py --force-enabled --dry-run   # run, log only, never reboot
+watchdog:
+  enabled: false                  # master switch — opt-in (must be true to run)
+  check_interval_sec: 30          # how often to evaluate liveness
+  liveness_file: ""               # "" = use paths.dashboard_state (runtime/dashboard_state.json)
+  stale_after_sec: 300            # liveness age (sec) that counts as frozen/dead (~30x the 10s write cadence)
+  boot_grace_sec: 180             # ignore staleness for this long after the watchdog starts
+  reboot_on_missing_file: false   # false = a missing liveness file is NOT treated as a freeze
+  require_seen_alive: true        # only arm after observing a fresh liveness at least once
+  consecutive_stale_required: 2   # require N consecutive stale checks before acting (absorbs blips)
+  min_seconds_between_reboots: 900 # boot-loop guard: >=15 min between forced reboots
+  max_reboots_per_day: 5          # boot-loop guard: cap per rolling 24h, then suppress + log CRITICAL
+  active_hours: ""                # "" = always; else "HH:MM-HH:MM" window when a reboot may fire (wraps midnight)
+  reboot_delay_sec: 30            # shutdown /t delay — lets in-flight writes settle
+  reboot_message: "HGCC watchdog: counting runtime unresponsive - auto restart"
+  dry_run: false                  # true = log the reboot decision but never actually reboot
+  state_file: "data/state/watchdog_state.json"  # persists reboot history across reboots (loop guard)
 
 # Camera Configuration
 # Format:
@@ -20,24 +66,13 @@ supabase:
 #     zones_file: "relative/path/to/zones_CameraName.json"
 #     note: "optional description"
 
-cameras:
-  Camera_01:
-    rtsp_url: "rtsp://<user>:<pass>@<camera-01-host>:554/ch01/0"
-    enabled: true
-    zones_file: "data/zones/zones_Camera_01.json"
-    note: "Main shop view"
-  
-  Camera_02:
-    rtsp_url: "rtsp://<user>:<pass>@<camera-02-host>:554/ch01/0"
-    enabled: true
-    zones_file: "data/zones/zones_Camera_02.json"
-    note: "Wash area"
-  
-  # Camera_03:
-  #   rtsp_url: "rtsp://..."
-  #   enabled: false
-  #   zones_file: "data/zones/zones_Camera_03.json"
-  #   note: "Backup camera"
+cameras: {}
+  # Add one block per real camera; name it by IP. Example:
+  # Camera_192_168_1_132:
+  #   rtsp_url: "rtsp://<user>:<pass>@192.168.1.132:554/ch01/0"
+  #   enabled: true
+  #   zones_file: "data/zones/zones_Camera_192_168_1_132.json"
+  #   note: "Main counting camera"
 
 # YOLO Detection Configuration
 yolo:

@@ -2221,6 +2221,11 @@ class RuntimeService:
             "washes_by_zone": {},
         }
         self.recent_haircut_reid = []
+        # Returning customer re-sitting in a chair shortly after a haircut → wash
+        self.enable_chair_return_wash = _cfg_bool(runtime_cfg.get("enable_chair_return_wash", True), True)
+        self.event_chair_return_wash_window_sec = max(
+            60.0, float(runtime_cfg.get("event_chair_return_wash_window_sec", 900.0))
+        )
         self.recent_service_identity_events: List[Dict[str, object]] = []
         self.chair_empty_gallery_features: List[Dict[str, object]] = []
         self._chair_zone_occupied_keys: Set[str] = set()
@@ -4102,6 +4107,73 @@ class RuntimeService:
             })
         return kept
 
+    def _detect_chair_return_washes(self, service_merged: List[dict], now: float) -> List[dict]:
+        """A customer who re-sits in a CHAIR seat shortly after a haircut there (same
+        identity) is treated as a WASH return — not a new haircut. Heuristic, bounded
+        by event_chair_return_wash_window_sec; deduped via recent_service_identity_events
+        (once a wash is remembered, the existing identity guard blocks re-counting it).
+        Limited to the configured counting cameras (haircut_count_zones)."""
+        if not getattr(self, "enable_chair_return_wash", True):
+            return []
+        window = float(getattr(self, "event_chair_return_wash_window_sec", 900.0))
+        self._prune_recent_service_identity_events(now)
+        memory = list(self.recent_service_identity_events or [])
+        if not memory:
+            return []
+        out: List[dict] = []
+        seen_seats: Set[str] = set()
+        for d in service_merged or []:
+            zone = str(d.get("primary_zone", "") or "")
+            if not zone.startswith(CHAIR_ZONE_PREFIX):
+                continue
+            cam = str(d.get("cam", d.get("camera", "")) or "")
+            if not self._is_haircut_count_enabled_for(cam, zone):
+                continue
+            seat_key = self._build_seat_key(cam, zone)
+            if not seat_key or seat_key in seen_seats:
+                continue
+            pid = int(d.get("pid", 0) or 0)
+            gid = int(d.get("gid", 0) or 0)
+            emb = d.get("_event_emb")
+            if emb is None:
+                emb = self._compute_event_embedding_from_detection(d)
+                if emb is not None:
+                    d["_event_emb"] = emb
+            matched_haircut = False
+            already_washed = False
+            for prev in memory:
+                if str(prev.get("seat_key", "")) != seat_key:
+                    continue
+                age = now - float(prev.get("ts", 0.0))
+                if age < 0 or age > window:
+                    continue
+                same, _sim = self._is_same_identity_against_memory(prev, pid, gid, emb)
+                if not same:
+                    continue
+                ev_type = str(prev.get("event", "")).strip().lower()
+                if ev_type == "wash":
+                    already_washed = True
+                    break
+                if ev_type == "haircut":
+                    matched_haircut = True
+            if matched_haircut and not already_washed:
+                out.append({
+                    "camera": cam,
+                    "pid": pid,
+                    "gid": gid,
+                    "zone": zone,
+                    "dwell": float(d.get("zone_dwell_sec", d.get("dwell", 0.0)) or 0.0),
+                    "bbox": d.get("bbox"),
+                    "conf": float(d.get("conf", 0.0) or 0.0),
+                    "det_type": d.get("det_type"),
+                    "frame_w": int(d.get("frame_w", 0) or 0),
+                    "frame_h": int(d.get("frame_h", 0) or 0),
+                    "reason_code": "chair_return_wash",
+                    "_event_emb": emb,
+                })
+                seen_seats.add(seat_key)
+        return out
+
     def _canonicalize_pids_cross_camera(self, merged: List[dict]) -> List[dict]:
         """Merge PIDs across cameras using ReID embeddings before counting."""
         if not merged:
@@ -4412,6 +4484,22 @@ class RuntimeService:
                     self.fsm_state_counts = {}
                     self.fsm_recent_transitions = []
                 haircut_events = self._dedupe_haircut_events_by_reid(haircut_events, service_merged)
+                # Returning customer re-sitting in a chair shortly after a haircut → wash (not a new haircut)
+                try:
+                    chair_return_washes = self._detect_chair_return_washes(service_merged, time.time())
+                except Exception as _e:
+                    chair_return_washes = []
+                    logger.debug(f"chair-return-wash detect failed: {_e}")
+                if chair_return_washes:
+                    for _wev in chair_return_washes:
+                        _z = str(_wev.get("zone", ""))
+                        self.wash_counter.total_count += 1
+                        self.wash_counter.zone_total[_z] = self.wash_counter.zone_total.get(_z, 0) + 1
+                        if bool(getattr(self, "fsm_enabled", False)) and hasattr(self, "service_fsm"):
+                            self.service_fsm.wash_total = int(self.service_fsm.wash_total) + 1
+                            self.service_fsm.wash_zone_total[_z] = int(self.service_fsm.wash_zone_total.get(_z, 0)) + 1
+                    logger.info(f"Chair-return wash events: {len(chair_return_washes)}")
+                    wash_events = list(wash_events) + chair_return_washes
                 self._remember_service_events(haircut_events, "haircut")
                 self._remember_service_events(wash_events, "wash")
 

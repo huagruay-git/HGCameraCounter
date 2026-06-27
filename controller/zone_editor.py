@@ -24,11 +24,46 @@ from PySide6.QtWidgets import (
     QComboBox, QLineEdit, QMessageBox, QListWidget, QListWidgetItem
 )
 from PySide6.QtGui import QPainter, QPen, QColor, QPixmap, QImage
-from PySide6.QtCore import Qt, QPoint, QPointF, QRect
+from PySide6.QtCore import Qt, QPoint, QPointF, QRect, QThread, Signal
 import cv2
 
 
 ZoneTypeChoices = ["CHAIR", "WAIT", "WASH", "STAFF_AREA", "OTHER"]
+
+
+class _SnapshotLoader(QThread):
+    """Open an RTSP URL and grab ONE frame OFF the UI thread (with a connect timeout),
+    so the window never freezes ('Not Responding') while a camera connects."""
+    done = Signal(bool, object, int, int, str)  # ok, frame(ndarray|None), w, h, error
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            for prop in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC"):
+                if hasattr(cv2, prop):
+                    try:
+                        cap.set(getattr(cv2, prop), 8000)
+                    except Exception:
+                        pass
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                self.done.emit(False, None, 0, 0, "no frame (connect failed / timeout)")
+                return
+            h, w = frame.shape[:2]
+            self.done.emit(True, frame, w, h, "")
+        except Exception as e:
+            self.done.emit(False, None, 0, 0, str(e))
+        finally:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
 
 
 class PolygonCanvas(QWidget):
@@ -316,9 +351,9 @@ class ZoneEditorWidget(QWidget):
         reload_cam_btn.clicked.connect(self.reload_cameras)
         hl.addWidget(reload_cam_btn)
         
-        load_btn = QPushButton("Load Snapshot")
-        load_btn.clicked.connect(self.load_snapshot_from_selected)
-        hl.addWidget(load_btn)
+        self.load_btn = QPushButton("Load Snapshot")
+        self.load_btn.clicked.connect(self.load_snapshot_from_selected)
+        hl.addWidget(self.load_btn)
 
         undo_btn = QPushButton("Undo")
         undo_btn.clicked.connect(self.canvas.undo)
@@ -485,30 +520,38 @@ class ZoneEditorWidget(QWidget):
             QMessageBox.warning(self, "Error", "RTSP URL not configured for this camera")
             self._set_status(f"RTSP URL missing for {cam}", is_error=True)
             return
-        # try to read one frame using OpenCV
+        # Grab the frame OFF the UI thread so the window stays responsive.
+        if getattr(self, "_snap_loader", None) is not None and self._snap_loader.isRunning():
+            self._set_status("Still loading the previous snapshot...")
+            return
+        if hasattr(self, "load_btn"):
+            self.load_btn.setEnabled(False)
+        self._set_status(f"Loading snapshot from {cam}...")
+        self._snap_loader = _SnapshotLoader(url)
+        self._snap_loader.done.connect(self._on_snapshot_loaded)
+        self._snap_loader.start()
+
+    def _on_snapshot_loaded(self, ok: bool, frame, w: int, h: int, error: str):
+        if hasattr(self, "load_btn"):
+            self.load_btn.setEnabled(True)
+        if not ok or frame is None:
+            QMessageBox.critical(self, "Error", f"Cannot capture frame: {error}")
+            self._set_status(f"Snapshot failed: {error}", is_error=True)
+            return
         try:
-            cap = cv2.VideoCapture(url)
-            ret, frame = cap.read()
-            cap.release()
-            if not ret:
-                QMessageBox.critical(self, "Error", "Cannot capture frame from camera")
-                self._set_status(f"Cannot capture frame from {cam}", is_error=True)
-                return
-            # convert to QImage
-            h, w, ch = frame.shape
-            bytes_per_line = ch * w
-            qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
+            ch = frame.shape[2] if frame.ndim == 3 else 1
+            # .copy() so the QImage owns its pixels (the ndarray is freed after this slot).
+            qimg = QImage(frame.data, w, h, ch * w, QImage.Format_BGR888).copy()
             self.canvas.load_image(qimg)
-            # Re-normalize existing zones in case source file used pixel coordinates.
             cam_zones = self.zones.get(self.current_camera, [])
             if cam_zones:
                 for z in cam_zones:
                     z["points"] = self._normalized_points(z.get("points", []), image_size=(w, h))
                 self._refresh_canvas_polygons()
-            self._set_status(f"Snapshot loaded for {cam} ({w}x{h})")
+            self._set_status(f"Snapshot loaded for {self.current_camera} ({w}x{h})")
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Snapshot failed: {e}")
-            self._set_status(f"Snapshot failed: {e}", is_error=True)
+            QMessageBox.critical(self, "Error", f"Snapshot render failed: {e}")
+            self._set_status(f"Snapshot render failed: {e}", is_error=True)
 
     def create_zone_from_current(self):
         name = self.zone_name.text().strip()

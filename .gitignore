@@ -5,6 +5,7 @@ __pycache__/
 .Python
 *.egg-info/
 *.spec
+!packaging/pyinstaller/hgcc.spec
 .pytest_cache/
 
 # ===== Virtual environments =====
@@ -33,6 +34,7 @@ runtime/*.log
 data/config/config.yaml
 data/config/cloud_session.json
 data/config/salon_ai.runtime.yaml
+data/config/auth.json
 data/config/backups/
 
 # ===== Models (large binaries — use Git LFS or external storage) =====
@@ -66,6 +68,10 @@ temp_clips/
 data/recordings/
 runtime/processor_sync_state.json
 runtime/chair_service_autotrain_state.json
+runtime/dashboard_state.json
+runtime/dashboard_state*.tmp
+runtime/runtime_settings.override.json
+data/state/watchdog_state.json
 
 # ===== Third-party binaries =====
 tools/ffmpeg/

@@ -413,6 +413,8 @@ class LANCameraScannerWorker(QThread):
         ports: List[int],
         timeout_ms: int = 1200,
         max_workers: int = 64,
+        use_onvif: bool = True,
+        all_brands: bool = True,
     ):
         super().__init__()
         self.subnet = subnet.strip()
@@ -424,212 +426,78 @@ class LANCameraScannerWorker(QThread):
         self.ports = ports
         self.timeout_ms = max(200, timeout_ms)
         self.max_workers = max(1, min(max_workers, 256))
+        self.use_onvif = use_onvif
+        self.all_brands = all_brands
         self._stop_requested = False
+        self._last_done = 0
+        self._last_total = 0
 
     def stop(self):
         self._stop_requested = True
 
     def run(self):
+        # Delegate to the shared discovery engine (multi-subnet + multi-brand + ONVIF).
         try:
-            network = ipaddress.ip_network(self.subnet, strict=False)
-        except ValueError as e:
-            self.scan_error.emit(f"Invalid subnet '{self.subnet}': {e}")
+            from shared import camera_discovery as camdisc
+        except Exception as e:
+            self.scan_error.emit(f"Discovery engine unavailable: {e}")
             return
 
-        hosts = [str(ip) for ip in network.hosts()]
-        total_hosts = len(hosts)
-        if total_hosts == 0:
-            self.scan_error.emit("No hosts in subnet")
-            return
-        if total_hosts > 4096:
-            self.scan_error.emit("Subnet too large. Please scan no more than 4096 hosts at a time.")
+        raw = (self.subnet or "").strip()
+        if raw.lower() == "auto":
+            subnets = camdisc.list_local_subnets()
+        else:
+            subnets = [s.strip() for s in raw.split(",") if s.strip()]
+        if not subnets:
+            self.scan_error.emit("No subnet given")
             return
 
-        done = 0
-        found = 0
-        stopped = False
+        def _map(r: dict) -> dict:
+            code = r.get("status_code")
+            brand = r.get("brand", "")
+            return {
+                "ip": r.get("ip", ""),
+                "port": r.get("port", ""),
+                "rtsp_url": r.get("rtsp_url", ""),
+                "status_code": code if code is not None else "",
+                "status_text": (f"{brand} | {r.get('status_text', '')}").strip(" |"),
+                "frame_ok": code == 200,
+                "note": (f"[{brand}] {r.get('note', '')}").strip(),
+            }
 
-        pool = ThreadPoolExecutor(max_workers=self.max_workers)
+        def _prog(done: int, total: int, msg: str):
+            self._last_done, self._last_total = done, total
+            self.progress.emit(done, total, msg)
+
         try:
-            futures = {pool.submit(self._scan_host, ip): ip for ip in hosts}
-            for future in as_completed(futures):
-                if self._stop_requested:
-                    stopped = True
-                    for f in futures:
-                        f.cancel()
-                    break
-
-                ip = futures[future]
-                done += 1
-                try:
-                    result = future.result()
-                except Exception as e:
-                    self.progress.emit(done, total_hosts, f"{ip} error: {e}")
-                    continue
-
-                if result:
-                    found += 1
-                    self.camera_found.emit(result)
-                    self.progress.emit(done, total_hosts, f"{ip} found")
-                elif done == total_hosts or done % 16 == 0:
-                    self.progress.emit(done, total_hosts, f"{ip} scanned")
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+            results = camdisc.scan(
+                subnets=subnets,
+                username=self.username,
+                password=self.password,
+                ports=self.ports,
+                channel_start=self.channel_start,
+                channel_end=self.channel_end,
+                extra_template=self.path_template,
+                all_brands=self.all_brands,
+                timeout_ms=self.timeout_ms,
+                max_workers=self.max_workers,
+                use_onvif=self.use_onvif,
+                on_found=lambda r: self.camera_found.emit(_map(r)),
+                on_progress=_prog,
+                should_stop=lambda: self._stop_requested,
+            )
+        except Exception as e:
+            self.scan_error.emit(f"Scan failed: {e}")
+            return
 
         self.scan_finished.emit(
             {
-                "total": total_hosts,
-                "scanned": done,
-                "found": found,
-                "stopped": stopped,
+                "total": self._last_total or len(results),
+                "scanned": self._last_done or len(results),
+                "found": len(results),
+                "stopped": self._stop_requested,
             }
         )
-
-    def _scan_host(self, ip: str) -> Optional[dict]:
-        for port in self.ports:
-            if self._stop_requested:
-                return None
-            if not self._is_tcp_port_open(ip, port):
-                continue
-
-            first_rtsp_response: Optional[Tuple[int, str]] = None
-            for rtsp_url in self._candidate_urls(ip, port):
-                if self._stop_requested:
-                    return None
-                code, status_line = self._rtsp_options(rtsp_url)
-                if code is None:
-                    continue
-                if first_rtsp_response is None:
-                    first_rtsp_response = (code, status_line)
-                if code in (200, 401):
-                    frame_ok = code == 200
-                    frame_note = "RTSP endpoint reachable" if code == 200 else "Auth required"
-                    return {
-                        "ip": ip,
-                        "port": port,
-                        "rtsp_url": rtsp_url,
-                        "status_code": code,
-                        "status_text": status_line,
-                        "frame_ok": frame_ok,
-                        "note": frame_note,
-                    }
-
-            if first_rtsp_response is not None:
-                code, status_line = first_rtsp_response
-                return {
-                    "ip": ip,
-                    "port": port,
-                    "rtsp_url": "",
-                    "status_code": code,
-                    "status_text": status_line,
-                    "frame_ok": False,
-                    "note": "RTSP service detected but no known stream path matched",
-                }
-        return None
-
-    def _candidate_urls(self, ip: str, port: int) -> List[str]:
-        auth = ""
-        if self.username or self.password:
-            auth = f"{quote(self.username, safe='')}:{quote(self.password, safe='')}@"
-        base = f"rtsp://{auth}{ip}:{port}"
-
-        def normalize_path(path: str) -> str:
-            p = path.strip()
-            if not p:
-                return ""
-            if not p.startswith("/"):
-                p = f"/{p}"
-            return p
-
-        candidate_paths: List[str] = []
-        template = self.path_template
-        if template:
-            if "{channel}" in template:
-                for ch in range(self.channel_start, self.channel_end + 1):
-                    candidate_paths.append(normalize_path(template.replace("{channel}", str(ch))))
-            else:
-                candidate_paths.append(normalize_path(template))
-        else:
-            candidate_paths.extend(
-                [
-                    "/cam/realmonitor?channel=1&subtype=0",
-                    "/Streaming/Channels/101",
-                    "/h264/ch1/main/av_stream",
-                    "/live/ch00_0",
-                ]
-            )
-
-        dedup: List[str] = []
-        seen = set()
-        for path in candidate_paths:
-            if not path or path in seen:
-                continue
-            dedup.append(path)
-            seen.add(path)
-
-        return [f"{base}{path}" for path in dedup]
-
-    def _is_tcp_port_open(self, ip: str, port: int) -> bool:
-        timeout_sec = self.timeout_ms / 1000.0
-        try:
-            with socket.create_connection((ip, port), timeout=timeout_sec):
-                return True
-        except Exception:
-            return False
-
-    def _rtsp_options(self, rtsp_url: str) -> Tuple[Optional[int], str]:
-        timeout_sec = self.timeout_ms / 1000.0
-        try:
-            parsed = urlparse(rtsp_url)
-            host = parsed.hostname
-            port = parsed.port or 554
-            if not host:
-                return None, "Invalid URL host"
-
-            request = (
-                f"OPTIONS {rtsp_url} RTSP/1.0\r\n"
-                "CSeq: 1\r\n"
-                "User-Agent: HGCameraCounter/1.0\r\n"
-                "\r\n"
-            ).encode("ascii", errors="ignore")
-
-            with socket.create_connection((host, port), timeout=timeout_sec) as sock:
-                sock.settimeout(timeout_sec)
-                sock.sendall(request)
-                data = sock.recv(4096)
-
-            if not data:
-                return None, "No RTSP response"
-
-            header_text = data.decode("utf-8", errors="ignore")
-            first_line = header_text.splitlines()[0].strip() if header_text else ""
-            match = re.search(r"RTSP/\d\.\d\s+(\d{3})", first_line)
-            if not match:
-                return None, first_line or "Invalid RTSP header"
-            return int(match.group(1)), first_line
-        except Exception as e:
-            return None, str(e)
-
-    def _verify_frame(self, rtsp_url: str) -> Tuple[bool, str]:
-        try:
-            start = time.time()
-            cap = cv2.VideoCapture(rtsp_url)
-            try:
-                if hasattr(cv2, "CAP_PROP_CONNECT_TIMEOUT"):
-                    cap.set(cv2.CAP_PROP_CONNECT_TIMEOUT, self.timeout_ms)
-                elif hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.timeout_ms)
-            except Exception:
-                pass
-            ok, _ = cap.read()
-            cap.release()
-            elapsed = (time.time() - start) * 1000.0
-            if ok:
-                return True, f"Frame OK ({elapsed:.0f}ms)"
-            return False, "Connected but no frame"
-        except Exception as e:
-            return False, f"Frame test failed: {e}"
-
 
 class LANCameraScannerDialog(QDialog):
     """Dialog for scanning LAN IP range and adding discovered cameras."""
@@ -649,9 +517,15 @@ class LANCameraScannerDialog(QDialog):
         layout = QVBoxLayout(self)
 
         subnet_row = QHBoxLayout()
-        subnet_row.addWidget(QLabel("Subnet (CIDR):"))
+        subnet_row.addWidget(QLabel("Subnet(s):"))
         self.subnet_input = QLineEdit(_guess_default_subnet())
+        self.subnet_input.setPlaceholderText(
+            "CIDR(s) comma-separated or 'auto' — e.g. 10.66.0.0/24,192.168.1.0/24")
         subnet_row.addWidget(self.subnet_input, 2)
+        self.auto_subnet_btn = QPushButton("Auto")
+        self.auto_subnet_btn.setToolTip("Fill every subnet this PC is attached to")
+        self.auto_subnet_btn.clicked.connect(self._fill_auto_subnets)
+        subnet_row.addWidget(self.auto_subnet_btn)
         subnet_row.addWidget(QLabel("Ports:"))
         self.ports_input = QLineEdit("554,8554")
         self.ports_input.setPlaceholderText("e.g. 554,8554")
@@ -696,6 +570,14 @@ class LANCameraScannerDialog(QDialog):
         self.workers_spin.setRange(1, 256)
         self.workers_spin.setValue(64)
         scan_row.addWidget(self.workers_spin)
+        self.onvif_check = QCheckBox("ONVIF auto-discover")
+        self.onvif_check.setChecked(True)
+        self.onvif_check.setToolTip("Find ONVIF cameras via WS-Discovery (no IP/credentials needed)")
+        scan_row.addWidget(self.onvif_check)
+        self.allbrands_check = QCheckBox("Try all brands")
+        self.allbrands_check.setChecked(True)
+        self.allbrands_check.setToolTip("Try Dahua/Hikvision/Uniview/Axis/… RTSP paths, not just the template")
+        scan_row.addWidget(self.allbrands_check)
         scan_row.addStretch()
         layout.addLayout(scan_row)
 
@@ -748,6 +630,15 @@ class LANCameraScannerDialog(QDialog):
             self.worker.wait(1500)
         super().closeEvent(event)
 
+    def _fill_auto_subnets(self):
+        try:
+            from shared import camera_discovery as camdisc
+            subnets = camdisc.list_local_subnets()
+            self.subnet_input.setText(",".join(subnets))
+            self.status_label.setText(f"Auto: {len(subnets)} local subnet(s)")
+        except Exception as e:
+            QMessageBox.warning(self, "Auto Subnets", f"Could not detect local subnets: {e}")
+
     def _parse_ports(self) -> Optional[List[int]]:
         raw = self.ports_input.text().strip()
         if not raw:
@@ -790,6 +681,8 @@ class LANCameraScannerDialog(QDialog):
             ports=ports,
             timeout_ms=self.timeout_spin.value(),
             max_workers=self.workers_spin.value(),
+            use_onvif=self.onvif_check.isChecked(),
+            all_brands=self.allbrands_check.isChecked(),
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.camera_found.connect(self._on_found)

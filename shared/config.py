@@ -3,10 +3,52 @@ Centralized configuration management
 """
 
 import os
+import sys
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 import yaml
+
+
+def _app_base() -> Path:
+    """Base dir for relative paths: project root (source) or the exe folder (frozen)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+try:
+    from shared.secure import decrypt_secret, encrypt_secret, is_encrypted
+except Exception:  # fallback when imported outside the package
+    try:
+        from .secure import decrypt_secret, encrypt_secret, is_encrypted
+    except Exception:
+        decrypt_secret = encrypt_secret = is_encrypted = None
+
+# Fields holding machine-bound secrets: stored DPAPI-encrypted at rest and
+# decrypted transparently on load. See shared/secure.py.
+_SECRET_PATHS = (
+    ("supabase", "key"),
+    ("supabase", "cloud_sync", "device_token"),
+)
+
+
+def _decrypt_secrets(obj):
+    """Recursively decrypt any 'enc:dpapi:*' values; leave failures encrypted."""
+    if is_encrypted is None:
+        return obj
+    if isinstance(obj, dict):
+        return {k: _decrypt_secrets(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_decrypt_secrets(v) for v in obj]
+    if is_encrypted(obj):
+        try:
+            return decrypt_secret(obj)
+        except Exception as e:
+            print(f"[config] WARNING: secret decrypt failed (config from another machine?): {e}")
+            return obj
+    return obj
+
 
 class Config:
     """Configuration loader and manager"""
@@ -21,10 +63,12 @@ class Config:
         """
         raw_path = Path(config_path or "data/config/config.yaml")
         if not raw_path.is_absolute():
-            raw_path = Path(__file__).resolve().parent.parent / raw_path
+            raw_path = _app_base() / raw_path
         self.config_path = str(raw_path)
         self.data: Dict[str, Any] = {}
         self.load()
+        # Transparently decrypt machine-bound secrets (DPAPI); callers see plaintext.
+        self.data = _decrypt_secrets(self.data)
     
     def load(self):
         """Load configuration from file"""
@@ -68,6 +112,9 @@ class Config:
             payload = payload.get_all()
         if not isinstance(payload, dict):
             raise TypeError(f"Config.save expected dict data, got {type(payload).__name__}")
+
+        # Re-encrypt machine-bound secrets so they are never written to disk in plaintext.
+        payload = self._encrypt_secret_paths(payload)
         
         try:
             if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
@@ -80,6 +127,28 @@ class Config:
             print(f"เนยย Error saving config: {e}")
             raise
     
+    def _encrypt_secret_paths(self, payload):
+        """Return a copy of payload with secret fields DPAPI-encrypted for disk."""
+        if encrypt_secret is None or not isinstance(payload, dict):
+            return payload
+        import copy
+        out = copy.deepcopy(payload)
+        for path in _SECRET_PATHS:
+            d = out
+            for p in path[:-1]:
+                d = d.get(p) if isinstance(d, dict) else None
+                if not isinstance(d, dict):
+                    break
+            if isinstance(d, dict):
+                leaf = path[-1]
+                val = d.get(leaf)
+                if isinstance(val, str) and val and not is_encrypted(val):
+                    try:
+                        d[leaf] = encrypt_secret(val)
+                    except Exception as e:
+                        print(f"[config] WARNING: could not encrypt {'.'.join(path)}: {e}")
+        return out
+
     def get(self, key: str, default=None) -> Any:
         """Get config value"""
         return self.data.get(key, default)
@@ -121,24 +190,21 @@ class Config:
         """Get default configuration"""
         defaults = {
             "project_name": "HG Camera Counter",
-            "version": "0.1.0",
+            "version": "0.2.0",
             "branch_code": os.getenv("BRANCH_CODE", "DEMO"),
+            # When true, the dashboard auto-starts counting shortly after it opens
+            # (unattended boot recovery). The Startup launcher also passes --autostart
+            # which both enables this and skips the PIN on the machine-bound device.
+            "auto_start_service": False,
+            # AI model updates pulled from a public manifest (the "อัปเดตโมเดล" tab).
+            "models": {
+                "manifest_url": os.getenv("MODELS_MANIFEST_URL", ""),
+            },
             "supabase": {
                 "url": os.getenv("SUPABASE_URL", ""),
                 "key": os.getenv("SUPABASE_ANON_KEY", ""),
             },
-            "cameras": {
-                "Camera_01": {
-                    "rtsp_url": os.getenv("CAM1_URL", ""),
-                    "enabled": True,
-                    "note": ""
-                },
-                "Camera_02": {
-                    "rtsp_url": os.getenv("CAM2_URL", ""),
-                    "enabled": True,
-                    "note": ""
-                }
-            },
+            "cameras": {},
             "yolo": {
                 "model": "best.pt",
                 "discovery_model": "yolov8n.pt",
@@ -225,10 +291,27 @@ class Config:
                 "reports": "reports",
                 "snapshots": "snapshots",
                 "logs": "logs",
-            }
+            },
+            "watchdog": {
+                "enabled": False,
+                "check_interval_sec": 30.0,
+                "liveness_file": "",
+                "stale_after_sec": 300.0,
+                "boot_grace_sec": 180.0,
+                "reboot_on_missing_file": False,
+                "require_seen_alive": True,
+                "consecutive_stale_required": 2,
+                "min_seconds_between_reboots": 900.0,
+                "max_reboots_per_day": 5,
+                "active_hours": "",
+                "reboot_delay_sec": 30,
+                "reboot_message": "HGCC watchdog: counting runtime unresponsive - auto restart",
+                "dry_run": False,
+                "state_file": "data/state/watchdog_state.json",
+            },
         }
         try:
-            template_path = Path(__file__).resolve().parent.parent / "data" / "config" / "config.template.yaml"
+            template_path = _app_base() / "data" / "config" / "config.template.yaml"
             if template_path.exists():
                 tmpl = yaml.safe_load(template_path.read_text(encoding="utf-8")) or {}
                 if isinstance(tmpl, dict):

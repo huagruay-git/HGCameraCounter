@@ -30,8 +30,8 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QTextEdit, QSplitter, QSpinBox, QFileDialog,
     QListWidget, QListWidgetItem, QDoubleSpinBox, QComboBox, QLineEdit,
     QFormLayout, QGroupBox, QProgressBar, QTableWidget, QTableWidgetItem,
-    QCheckBox, QScrollArea,
-    QHeaderView
+    QCheckBox, QScrollArea, QFrame, QGridLayout,
+    QHeaderView, QAbstractItemView
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize
 from PySide6.QtGui import QIcon, QFont, QColor, QDesktopServices, QImage, QPixmap
@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from shared.config import Config
 from shared.logger import setup_logger
 from shared.dashboard_updater import init_dashboard_service, get_broadcaster
-from shared.updater import Updater
+from shared.updater import Updater, is_newer, read_version_file
 from controller.setup_wizard import SetupWizard
 from controller.dashboard_client import GUIDashboardClient
 from controller.camera_manager import CameraManagerWidget
@@ -50,12 +50,32 @@ from controller.zone_editor import ZoneEditorWidget
 from controller.staff_builder import StaffBuilderWidget
 from controller.live_viewer import LiveViewerWidget
 from controller.performance_widget import PerformanceWidget
+from controller.theme import apply_theme, SidebarTabWidget
+from controller.login import run_login_gate
 
 # =========================
 # SETUP
 # =========================
 CONFIG = Config("data/config/config.yaml")
 logger = setup_logger("controller", CONFIG.get("paths", {}).get("logs", "logs"))
+
+
+def _app_icon_path() -> str:
+    """Resolve the HUAGRUAY app icon (assets/), for both source and frozen builds."""
+    bases = []
+    if getattr(sys, "frozen", False):
+        bases.append(Path(sys.executable).resolve().parent)   # shipped next to the exe
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            bases.append(Path(meipass))                        # bundled inside the build
+    else:
+        bases.append(Path(__file__).resolve().parent.parent)
+    for base in bases:
+        for name in ("app_icon.ico", "app_icon.png"):
+            p = base / "assets" / name
+            if p.exists():
+                return str(p)
+    return ""
 
 
 class CommandWorker(QObject):
@@ -102,24 +122,24 @@ class CommandWorker(QObject):
                 models = [m["name"] for m in data.get("models", [])]
                 if models:
                     target = next((m for m in models if "llava" in m or "llama3" in m), models[0])
-                    self.status_ai_model.setText(f"AI: ๐ข {target}")
+                    self.status_ai_model.setText(f"AI: {target}")
                     self.status_ai_model.setStyleSheet("color: green; font-weight: bold;")
                 else:
-                    self.status_ai_model.setText("AI: ๐”ด No Models")
+                    self.status_ai_model.setText("AI: No Models")
                     self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
         except Exception:
-             self.status_ai_model.setText("AI: ๐”ด Offline (YOLO Only)")
+             self.status_ai_model.setText("AI: Offline (YOLO Only)")
              self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
 
     def tab_llm(self):
         from controller.llm_evaluation_ui import LLMEvaluationWidget
         self.llm_tab_widget = LLMEvaluationWidget()
-        self.tabs.addTab(self.llm_tab_widget, "๐ค– AI Evaluation")
+        self.tabs.addTab(self.llm_tab_widget, "AI Evaluation")
         
     def tab_cloud_sync(self):
         from controller.cloud_sync_widget import CloudSyncWidget
         self.cloud_sync_widget = CloudSyncWidget(self.config_manager)
-        self.tabs.addTab(self.cloud_sync_widget, "โ๏ธ Cloud Sync")
+        self.tabs.addTab(self.cloud_sync_widget, "Cloud Sync")
 
 # =========================
 # MAIN CONTROLLER
@@ -130,6 +150,73 @@ class FlexibleTabWidget(QTabWidget):
 
     def minimumSizeHint(self):
         return QSize(640, 360)
+
+
+class _UpdateWorker(QThread):
+    """Background OTA check (and optional download+verify) so the UI never blocks."""
+    done = Signal(dict)
+
+    def __init__(self, config_data, metadata_url, current_version, do_download):
+        super().__init__()
+        self._cfg = config_data
+        self._url = metadata_url
+        self._cur = current_version
+        self._dl = do_download
+
+    def run(self):
+        try:
+            upd = Updater(self._cfg)
+            meta = upd.check_for_update(self._url)
+            version, notes = upd.inspect_metadata_for_update(meta)
+            if not version or not is_newer(version, self._cur):
+                self.done.emit({"status": "uptodate", "version": version})
+                return
+            asset = upd.select_primary_asset(meta)
+            if not asset:
+                self.done.emit({"status": "error", "error": "no downloadable asset in metadata"})
+                return
+            if not self._dl:
+                self.done.emit({"status": "available", "version": version, "notes": notes})
+                return
+            path = upd.download_asset(asset.get("url"), name=asset.get("name"))
+            sha = asset.get("sha256") or asset.get("sha") or asset.get("checksum")
+            if sha and not upd.verify_sha256(path, sha):
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self.done.emit({"status": "error", "error": "sha256 mismatch (download rejected)"})
+                return
+            staged = upd.stage_update(path)
+            self.done.emit({"status": "ready", "version": version, "notes": notes, "path": str(staged)})
+        except Exception as e:
+            self.done.emit({"status": "error", "error": str(e)})
+
+
+class _ModelOTAWorker(QThread):
+    """Background model-update worker: fetch the public manifest, or download+apply one."""
+    done = Signal(dict)
+
+    def __init__(self, op: str, payload, dest=None):
+        super().__init__()
+        self._op = op            # 'list' | 'apply'
+        self._payload = payload  # manifest url (list) | manifest entry dict (apply)
+        self._dest = dest        # local model path (apply)
+
+    def run(self):
+        try:
+            from runtime.model_ota import fetch_model_manifest, apply_model_from_entry
+            if self._op == "list":
+                man = fetch_model_manifest(str(self._payload))
+                models = man.get("models", []) if isinstance(man, dict) else []
+                self.done.emit({"status": "list", "models": models})
+            elif self._op == "apply":
+                version = apply_model_from_entry(self._payload, self._dest)
+                self.done.emit({"status": "applied", "version": version})
+            else:
+                self.done.emit({"status": "error", "error": f"unknown op {self._op}"})
+        except Exception as e:
+            self.done.emit({"status": "error", "error": str(e), "op": self._op})
 
 
 class MainController(QMainWindow):
@@ -168,6 +255,9 @@ class MainController(QMainWindow):
         self.camera_manager = CameraManagerWidget(self)
         
         self.setWindowTitle("HG Camera Counter - Controller")
+        _icon = _app_icon_path()
+        if _icon:
+            self.setWindowIcon(QIcon(_icon))
         self.setGeometry(100, 100, 1200, 800)
         
         # Setup UI
@@ -216,32 +306,37 @@ class MainController(QMainWindow):
         header_layout.addStretch()
         
         # Start/Stop button
-        self.start_btn = QPushButton("โ–ถ Start Service")
+        self.start_btn = QPushButton("Start Service")
         self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;")
         self.start_btn.clicked.connect(self.start_service)
         header_layout.addWidget(self.start_btn)
         
-        self.stop_btn = QPushButton("โน Stop Service")
+        self.stop_btn = QPushButton("Stop Service")
         self.stop_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 5px;")
         self.stop_btn.clicked.connect(self.stop_service)
         self.stop_btn.setEnabled(False)
         header_layout.addWidget(self.stop_btn)
 
         # Check updates button
-        self.check_updates_btn = QPushButton("โฌ Check Updates")
+        self.check_updates_btn = QPushButton("Check Updates")
         self.check_updates_btn.setToolTip("Check for remote updates")
         self.check_updates_btn.clicked.connect(self.check_updates)
         header_layout.addWidget(self.check_updates_btn)
         # Install updates button
-        self.install_update_btn = QPushButton("โฌ Install Update")
+        self.install_update_btn = QPushButton("Install Update")
         self.install_update_btn.setToolTip("Run a staged installer from updates/")
         self.install_update_btn.clicked.connect(self.install_update)
         header_layout.addWidget(self.install_update_btn)
+        # Update settings (URL + auto-update toggles)
+        self.update_settings_btn = QPushButton("Update Settings")
+        self.update_settings_btn.setToolTip("Set the update URL and turn auto-update on/off")
+        self.update_settings_btn.clicked.connect(self.open_update_settings)
+        header_layout.addWidget(self.update_settings_btn)
         
         layout.addLayout(header_layout)
         
         # Tabs
-        self.tabs = FlexibleTabWidget()
+        self.tabs = SidebarTabWidget()
         
         self.tab_dashboard()
         self.tab_live_view()
@@ -265,25 +360,155 @@ class MainController(QMainWindow):
         self.tab_logs()
         self.tab_model_train()
         self.tab_model_test()
+        self.tab_model_updates()
         self.tab_dataset_lab()
         
         layout.addWidget(self.tabs)
         
         central_widget.setLayout(layout)
-        
+
         # Status bar
         self.statusBar().showMessage("Ready")
+
+        # Optional silent auto-check for updates shortly after launch (opt-in via config).
+        self._update_worker = None
+        QTimer.singleShot(4000, self._auto_check_on_startup)
+
+        # Optionally start counting automatically after the dashboard opens, so a branch
+        # PC resumes unattended after a reboot/power cut. Enabled by --autostart at boot
+        # (HGCC_AUTOSTART=1) or the persistent `auto_start_service` config flag.
+        QTimer.singleShot(7000, self._auto_start_service_on_boot)
+
+        # Re-check for updates periodically (default every 24h) so a PC left running for
+        # days still picks up new releases without a manual restart. The startup check
+        # above covers fresh launches; this covers long-running sessions. 0h disables it.
+        self._update_check_timer = None
+        self._setup_periodic_update_check()
     
+    def _kpi_card(self, title: str, attr: str) -> QFrame:
+        frame = QFrame()
+        frame.setStyleSheet("QFrame{background:#FFFFFF;border:1px solid #E3E3DD;border-radius:10px;}")
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(14, 10, 14, 12)
+        v.setSpacing(2)
+        t = QLabel(title)
+        t.setStyleSheet("color:#6B6B64;border:none;")
+        val = QLabel("0")
+        vf = QFont(); vf.setPointSize(19); vf.setBold(True)
+        val.setFont(vf)
+        val.setStyleSheet("color:#1A1A1A;border:none;")
+        setattr(self, attr, val)
+        v.addWidget(t)
+        v.addWidget(val)
+        return frame
+
+    def _build_kpi_header(self) -> QWidget:
+        container = QWidget()
+        box = QVBoxLayout(container)
+        box.setContentsMargins(0, 0, 0, 6)
+        box.setSpacing(10)
+
+        top = QHBoxLayout()
+        title = QLabel("แดชบอร์ด")
+        tf = QFont(); tf.setPointSize(15); tf.setBold(True)
+        title.setFont(tf)
+        self.kpi_status = QLabel("● หยุด")
+        self.kpi_status.setStyleSheet("color:#A32D2D;font-weight:500;")
+        top.addWidget(title)
+        top.addStretch()
+        top.addWidget(self.kpi_status)
+        box.addLayout(top)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        hero = QFrame()
+        hero.setStyleSheet("QFrame{background:#F5C518;border:none;border-radius:12px;}")
+        hv = QVBoxLayout(hero)
+        hv.setContentsMargins(16, 12, 16, 14)
+        hv.setSpacing(2)
+        hl = QLabel("ลูกค้าวันนี้")
+        hl.setStyleSheet("color:#161616;border:none;")
+        self.kpi_hero = QLabel("0")
+        hf = QFont(); hf.setPointSize(32); hf.setBold(True)
+        self.kpi_hero.setFont(hf)
+        self.kpi_hero.setStyleSheet("color:#161616;border:none;")
+        hv.addWidget(hl)
+        hv.addWidget(self.kpi_hero)
+        row.addWidget(hero, 2)
+        row.addWidget(self._kpi_card("ตัดผม", "kpi_haircuts"), 1)
+        row.addWidget(self._kpi_card("สระ", "kpi_washes"), 1)
+        row.addWidget(self._kpi_card("รอคิว", "kpi_waits"), 1)
+        row.addWidget(self._kpi_card("ในร้าน", "kpi_active"), 1)
+        box.addLayout(row)
+
+        grid_title = QLabel("กล้อง / โซนสด")
+        grid_title.setStyleSheet("color:#6B6B64;border:none;")
+        box.addWidget(grid_title)
+        self.kpi_grid_container = QWidget()
+        self.kpi_grid_layout = QGridLayout(self.kpi_grid_container)
+        self.kpi_grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.kpi_grid_layout.setSpacing(8)
+        box.addWidget(self.kpi_grid_container)
+        return container
+
+    def _chair_card(self, cam_name: str, connected: bool, people: int) -> QFrame:
+        if not connected:
+            bg, fg, status = "#FCEBEB", "#A32D2D", "ออฟไลน์"
+        elif people > 0:
+            bg, fg, status = "#FFF1C9", "#8A5412", f"{people} คน"
+        else:
+            bg, fg, status = "#F2F2EE", "#6B6B64", "ว่าง"
+        label = str(cam_name).replace("Camera_192_168_1_", "กล้อง .").replace("Camera_", "กล้อง ")
+        frame = QFrame()
+        frame.setStyleSheet(f"QFrame{{background:{bg};border:none;border-radius:10px;}}")
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(12, 9, 12, 10)
+        v.setSpacing(3)
+        t = QLabel(label)
+        t.setStyleSheet(f"color:{fg};border:none;font-weight:500;")
+        s = QLabel(status)
+        s.setStyleSheet(f"color:{fg};border:none;")
+        v.addWidget(t)
+        v.addWidget(s)
+        return frame
+
+    def _update_chair_grid(self, cameras: Dict[str, Any], people_map: Dict[str, int]) -> None:
+        if not hasattr(self, "kpi_grid_layout"):
+            return
+        try:
+            while self.kpi_grid_layout.count():
+                item = self.kpi_grid_layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+            col = 0
+            grid_row = 0
+            for cam_name, info in cameras.items():
+                if not info.get("enabled", True):
+                    continue
+                connected = bool(info.get("connected", False))
+                people = int(people_map.get(cam_name, self.cached_camera_people.get(cam_name, 0)))
+                self.kpi_grid_layout.addWidget(self._chair_card(cam_name, connected, people), grid_row, col)
+                col += 1
+                if col >= 3:
+                    col = 0
+                    grid_row += 1
+        except Exception as e:
+            logger.debug(f"chair grid update failed: {e}")
+
     def tab_dashboard(self):
         """Dashboard tab"""
         widget = QWidget()
         layout = QVBoxLayout()
         
+        # Redesigned KPI header (cards + live chair/camera grid)
+        layout.addWidget(self._build_kpi_header())
+
         # Status panel
         status_group_layout = QHBoxLayout()
         
         # Runtime status
-        self.status_runtime = QLabel("โซ Stopped")
+        self.status_runtime = QLabel("Stopped")
         self.status_runtime.setFont(QFont("Arial", 12, QFont.Bold))
         status_group_layout.addWidget(QLabel("Runtime:"))
         status_group_layout.addWidget(self.status_runtime)
@@ -291,7 +516,7 @@ class MainController(QMainWindow):
         status_group_layout.addSpacing(30)
         
         # AI Status
-        self.status_ai_model = QLabel("AI: ๐”ด Offline (Checking...)")
+        self.status_ai_model = QLabel("AI: Offline (Checking...)")
         self.status_ai_model.setStyleSheet("color: #E65100; font-weight: bold;")
         status_group_layout.addWidget(QLabel("Active AI Assist:"))
         status_group_layout.addWidget(self.status_ai_model)
@@ -427,23 +652,29 @@ class MainController(QMainWindow):
         layout.addLayout(tuning_box)
         
         # Auto-refresh indicator
-        self.auto_refresh_label = QLabel("๐” Auto-updating...")
+        self.auto_refresh_label = QLabel("Auto-updating...")
         self.auto_refresh_label.setStyleSheet("color: green; font-weight: bold;")
         layout.addWidget(self.auto_refresh_label)
         
         # Manual refresh button
-        refresh_btn = QPushButton("๐” Manual Refresh")
+        refresh_btn = QPushButton("Manual Refresh")
         refresh_btn.clicked.connect(self.refresh_dashboard)
         layout.addWidget(refresh_btn)
 
-        clear_btn = QPushButton("๐งน Clear Event Counts")
+        clear_btn = QPushButton("Clear Event Counts")
         clear_btn.clicked.connect(self.clear_event_counts)
         layout.addWidget(clear_btn)
         
         layout.addStretch()
         
         widget.setLayout(layout)
-        self.tabs.addTab(widget, "Dashboard")
+        # Wrap in a scroll area so the (tall) dashboard is never clipped when the
+        # window is shortened — all content stays reachable via scroll.
+        dash_scroll = QScrollArea()
+        dash_scroll.setWidgetResizable(True)
+        dash_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        dash_scroll.setWidget(widget)
+        self.tabs.addTab(dash_scroll, "Dashboard")
         
         # Store for update reference
         self.dashboard_widget = widget
@@ -574,7 +805,7 @@ class MainController(QMainWindow):
     def tab_live_view(self):
         """Live Viewer tab to see camera feed with zone overlays."""
         widget = LiveViewerWidget(self, config=self.config.data)
-        self.tabs.addTab(widget, "๐ฅ Live View")
+        self.tabs.addTab(widget, "Live View")
 
     def tab_setup(self):
         """Settings tab (launches setup wizard)."""
@@ -592,7 +823,7 @@ class MainController(QMainWindow):
         )
         layout.addWidget(info)
         
-        wizard_btn = QPushButton("โง Launch Setup Wizard")
+        wizard_btn = QPushButton("Launch Setup Wizard")
         wizard_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 10px;")
         wizard_btn.clicked.connect(self.launch_wizard)
         layout.addWidget(wizard_btn)
@@ -643,19 +874,19 @@ class MainController(QMainWindow):
         add_btn.clicked.connect(self.camera_manager.add_camera_dialog)
         actions_layout.addWidget(add_btn)
         
-        edit_btn = QPushButton("โ Edit Camera")
+        edit_btn = QPushButton("Edit Camera")
         edit_btn.clicked.connect(self.camera_manager.edit_camera_dialog)
         actions_layout.addWidget(edit_btn)
         
-        delete_btn = QPushButton("๐—‘ Delete Camera")
+        delete_btn = QPushButton("Delete Camera")
         delete_btn.clicked.connect(self.camera_manager.delete_camera)
         actions_layout.addWidget(delete_btn)
         
-        test_btn = QPushButton("โก Test Selected")
+        test_btn = QPushButton("Test Selected")
         test_btn.clicked.connect(self.camera_manager.test_camera)
         actions_layout.addWidget(test_btn)
         
-        test_all_btn = QPushButton("โก Test All")
+        test_all_btn = QPushButton("Test All")
         test_all_btn.clicked.connect(self.camera_manager.test_all_cameras)
         actions_layout.addWidget(test_all_btn)
         
@@ -664,11 +895,11 @@ class MainController(QMainWindow):
         # Import/Export
         import_export_layout = QHBoxLayout()
         
-        import_btn = QPushButton("๐“ฅ Import JSON")
+        import_btn = QPushButton("Import JSON")
         import_btn.clicked.connect(self.camera_manager.import_cameras_json)
         import_export_layout.addWidget(import_btn)
         
-        export_btn = QPushButton("๐“ค Export JSON")
+        export_btn = QPushButton("Export JSON")
         export_btn.clicked.connect(self.camera_manager.export_cameras_json)
         import_export_layout.addWidget(export_btn)
         
@@ -725,7 +956,7 @@ class MainController(QMainWindow):
         layout.addWidget(self.diagnostics_output)
 
         # Run button
-        run_btn = QPushButton("๐” Run Diagnostics")
+        run_btn = QPushButton("Run Diagnostics")
         run_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 10px;")
         run_btn.clicked.connect(self.run_diagnostics)
         layout.addWidget(run_btn)
@@ -974,6 +1205,149 @@ class MainController(QMainWindow):
         widget.setLayout(layout)
         self.tabs.addTab(widget, "Model Test")
 
+    # ------------------------------------------------------------------
+    # Model Updates (download a model version from the public manifest)
+    # ------------------------------------------------------------------
+    def _models_cfg(self) -> dict:
+        cfg = CONFIG.get('models', {})
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _local_model_path(self) -> Path:
+        root = self._project_root()
+        models_dir = self.config.get('paths', {}).get('models', 'models')
+        yolo = self.config.get('yolo', {}) or {}
+        name = yolo.get('worker_model') or yolo.get('model') or 'best.pt'
+        return root / models_dir / name
+
+    def _refresh_installed_model_label(self):
+        from runtime.model_ota import installed_model_version
+        p = self._local_model_path()
+        ver = installed_model_version(p) or "(ไม่ทราบเวอร์ชัน)"
+        state = "มีไฟล์" if p.exists() else "ยังไม่มีไฟล์"
+        self.model_installed_label.setText(f"โมเดลปัจจุบัน: {p.name} — เวอร์ชัน {ver} ({state})")
+
+    def tab_model_updates(self):
+        """List model versions from the public manifest and download+apply one."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        title = QLabel("อัปเดตโมเดล AI")
+        tf = QFont(); tf.setPointSize(14); tf.setBold(True); title.setFont(tf)
+        layout.addWidget(title)
+
+        self.model_installed_label = QLabel("")
+        layout.addWidget(self.model_installed_label)
+
+        row = QHBoxLayout()
+        self.model_refresh_btn = QPushButton("รีเฟรชรายการ")
+        self.model_refresh_btn.clicked.connect(self._refresh_model_list)
+        self.model_apply_btn = QPushButton("ดาวน์โหลด + ใช้งานที่เลือก")
+        self.model_apply_btn.setEnabled(False)
+        self.model_apply_btn.clicked.connect(self._apply_selected_model)
+        row.addWidget(self.model_refresh_btn)
+        row.addWidget(self.model_apply_btn)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self.model_table = QTableWidget(0, 5)
+        self.model_table.setHorizontalHeaderLabels(["เวอร์ชัน", "วันที่", "หมายเหตุ", "แนะนำ", "สถานะ"])
+        self.model_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.model_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.model_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.model_table.horizontalHeader().setStretchLastSection(True)
+        self.model_table.itemSelectionChanged.connect(
+            lambda: self.model_apply_btn.setEnabled(self.model_table.currentRow() >= 0))
+        layout.addWidget(self.model_table)
+
+        self.model_status_label = QLabel("")
+        self.model_status_label.setStyleSheet("color:#6B6B64;")
+        layout.addWidget(self.model_status_label)
+
+        self._model_entries = []
+        self._model_worker = None
+        self._refresh_installed_model_label()
+        self.tabs.addTab(widget, "อัปเดตโมเดล")
+
+        if str(self._models_cfg().get('manifest_url', '') or '').strip():
+            QTimer.singleShot(1500, self._refresh_model_list)
+        else:
+            self.model_status_label.setText("ยังไม่ได้ตั้งค่า models.manifest_url ใน config")
+
+    def _refresh_model_list(self):
+        url = str(self._models_cfg().get('manifest_url', '') or '').strip()
+        if not url:
+            self.model_status_label.setText("ยังไม่ได้ตั้งค่า models.manifest_url ใน config")
+            return
+        if getattr(self, '_model_worker', None) is not None and self._model_worker.isRunning():
+            return
+        self.model_status_label.setText("กำลังดึงรายการโมเดล...")
+        self.model_refresh_btn.setEnabled(False)
+        self._model_worker = _ModelOTAWorker('list', url)
+        self._model_worker.done.connect(self._on_model_worker_done)
+        self._model_worker.start()
+
+    def _apply_selected_model(self):
+        rowi = self.model_table.currentRow()
+        if rowi < 0 or rowi >= len(self._model_entries):
+            return
+        entry = self._model_entries[rowi]
+        ver = entry.get('version', '?')
+        if QMessageBox.question(
+                self, "ยืนยัน",
+                f"ดาวน์โหลดและใช้งานโมเดลเวอร์ชัน {ver}?\n"
+                "โมเดลเดิมจะถูกสำรองเป็น .bak และจะมีผลเมื่อ Stop → Start Service"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        if getattr(self, '_model_worker', None) is not None and self._model_worker.isRunning():
+            return
+        self.model_status_label.setText(f"กำลังดาวน์โหลดเวอร์ชัน {ver}...")
+        self.model_apply_btn.setEnabled(False)
+        self.model_refresh_btn.setEnabled(False)
+        self._model_worker = _ModelOTAWorker('apply', entry, str(self._local_model_path()))
+        self._model_worker.done.connect(self._on_model_worker_done)
+        self._model_worker.start()
+
+    def _populate_model_table(self, models):
+        from runtime.model_ota import installed_model_version
+        cur = installed_model_version(self._local_model_path())
+        self.model_table.setRowCount(0)
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            r = self.model_table.rowCount()
+            self.model_table.insertRow(r)
+            ver = str(m.get('version', ''))
+            self.model_table.setItem(r, 0, QTableWidgetItem(ver))
+            self.model_table.setItem(r, 1, QTableWidgetItem(str(m.get('created', ''))))
+            self.model_table.setItem(r, 2, QTableWidgetItem(str(m.get('notes', ''))))
+            self.model_table.setItem(r, 3, QTableWidgetItem("★ แนะนำ" if m.get('recommended') else ""))
+            self.model_table.setItem(r, 4, QTableWidgetItem("● ใช้อยู่" if ver and ver == cur else ""))
+        self.model_table.resizeColumnsToContents()
+
+    def _on_model_worker_done(self, result: dict):
+        self.model_refresh_btn.setEnabled(True)
+        status = result.get('status')
+        if status == 'list':
+            self._model_entries = [m for m in (result.get('models') or []) if isinstance(m, dict)]
+            self._populate_model_table(self._model_entries)
+            self.model_status_label.setText(f"พบ {len(self._model_entries)} เวอร์ชัน")
+        elif status == 'applied':
+            self._refresh_installed_model_label()
+            self._populate_model_table(self._model_entries)
+            self.model_status_label.setText(
+                f"ติดตั้งเวอร์ชัน {result.get('version')} แล้ว — Stop → Start Service เพื่อใช้งาน")
+            QMessageBox.information(
+                self, "สำเร็จ",
+                f"ติดตั้งโมเดลเวอร์ชัน {result.get('version')} แล้ว\n"
+                "กด Stop Service แล้ว Start Service เพื่อให้มีผล")
+        elif status == 'error':
+            err = str(result.get('error') or '')
+            if result.get('op') == 'list' and ('404' in err or 'Not Found' in err):
+                self.model_status_label.setText("ยังไม่มีโมเดลเผยแพร่บน Supabase (บริษัทยังไม่ได้อัป)")
+            else:
+                self.model_status_label.setText(f"ผิดพลาด: {err}")
+                QMessageBox.warning(self, "ผิดพลาด", f"ทำงานไม่สำเร็จ:\n{err}")
+
     def _metric_row_widget(self, label: QLabel, bar: QProgressBar) -> QWidget:
         w = QWidget()
         lay = QHBoxLayout()
@@ -1175,14 +1549,16 @@ class MainController(QMainWindow):
         """Return subprocess command to launch recorder."""
         root = self._project_root()
         if getattr(sys, "frozen", False):
-             # For frozen builds, similar logic to runtime_command (omitted for brevity)
-             # assuming same executable or explicit wrapper
-             pass
+            # Frozen: re-invoke this same exe in recorder mode (see packaging/launcher.py).
+            return [sys.executable, "--recorder"]
         return [sys.executable, "-u", str(root / "runtime" / "recorder.py")]
 
     def _processor_command(self) -> list[str]:
         """Return subprocess command to launch processor."""
         root = self._project_root()
+        if getattr(sys, "frozen", False):
+            # Frozen: re-invoke this same exe in runtime mode (see packaging/launcher.py).
+            return [sys.executable, "--runtime"]
         return [sys.executable, "-u", str(root / "runtime" / "processor.py")]
     
     def start_service(self):
@@ -1219,7 +1595,7 @@ class MainController(QMainWindow):
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
             
-            self.status_runtime.setText("๐ข Running")
+            self.status_runtime.setText("Running")
             self.status_runtime.setStyleSheet("color: green;")
             self.statusBar().showMessage("Service started")
             
@@ -1283,7 +1659,7 @@ class MainController(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         
-        self.status_runtime.setText("โซ Stopped")
+        self.status_runtime.setText("Stopped")
         self.status_runtime.setStyleSheet("color: red;")
         self.statusBar().showMessage("Service stopped")
         
@@ -1315,7 +1691,7 @@ class MainController(QMainWindow):
             
             # Update runtime status
             running = status.get("running", False)
-            self.status_runtime.setText("๐ข Running" if running else "โซ Stopped")
+            self.status_runtime.setText("Running" if running else "Stopped")
             self.status_runtime.setStyleSheet("color: green;" if running else "color: red;")
             
             # Update timestamp
@@ -1390,13 +1766,21 @@ class MainController(QMainWindow):
 
             # Snapshot list
             self.update_snapshot_list(status.get("recent_snapshots", []))
+
+            if hasattr(self, "kpi_status"):
+                self.kpi_status.setText("● กำลังทำงาน" if running else "● หยุด")
+                self.kpi_status.setStyleSheet(("color:#3B6D11;" if running else "color:#A32D2D;") + "font-weight:500;")
+            if hasattr(self, "kpi_active") and "active_tracks" in status:
+                self.kpi_active.setText(str(int(status.get("active_tracks", 0))))
+            self._update_chair_grid(cameras, status.get("camera_people", {}) or {})
+
             self._render_resources(status)
             self._render_effective_config(status)
             self._update_live_log_tail()
             
             # Update auto-refresh indicator
             if self.auto_refresh_label:
-                self.auto_refresh_label.setText("๐” Auto-updating...")
+                self.auto_refresh_label.setText("Auto-updating...")
         
         except Exception as e:
             logger.error(f"Error handling status update: {e}")
@@ -1411,6 +1795,15 @@ class MainController(QMainWindow):
             washes = summary.get("washes", summary.get("wash", 0))
             waits = summary.get("waits", summary.get("wait", 0))
             haircut_confirmed = summary.get("haircut_confirmed", haircuts)
+
+            if hasattr(self, "kpi_hero"):
+                self.kpi_hero.setText(str(haircuts))
+                self.kpi_haircuts.setText(str(haircuts))
+                self.kpi_washes.setText(str(washes))
+                self.kpi_waits.setText(str(waits))
+                _ap = summary.get("active_people")
+                if _ap is not None:
+                    self.kpi_active.setText(str(int(_ap)))
             
             text = f"""Haircuts: {haircuts}
 Washes: {washes}
@@ -1445,11 +1838,11 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         """Handle dashboard connection status change"""
         if connected:
             logger.info("Dashboard client connected")
-            self.auto_refresh_label.setText("๐ข Live")
+            self.auto_refresh_label.setText("Live")
             self.auto_refresh_label.setStyleSheet("color: green; font-weight: bold;")
         else:
             logger.warning("Dashboard client disconnected")
-            self.auto_refresh_label.setText("โ ๏ธ No connection")
+            self.auto_refresh_label.setText("No connection")
             self.auto_refresh_label.setStyleSheet("color: orange; font-weight: bold;")
 
     
@@ -1475,9 +1868,9 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             self.is_running = False
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
-            self.status_runtime.setText("โซ Stopped")
+            self.status_runtime.setText("Stopped")
             self.status_runtime.setStyleSheet("color: red;")
-            self.auto_refresh_label.setText("โ ๏ธ Services exited")
+            self.auto_refresh_label.setText("Services exited")
             self.auto_refresh_label.setStyleSheet("color: orange; font-weight: bold;")
             self.statusBar().showMessage("Services stopped unexpectedly")
         
@@ -1526,10 +1919,10 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
                     if summary:
                         self.on_summary_updated(summary)
                     if is_fresh and status.get("running", False):
-                        self.auto_refresh_label.setText("๐ข Live")
+                        self.auto_refresh_label.setText("Live")
                         self.auto_refresh_label.setStyleSheet("color: green; font-weight: bold;")
                     else:
-                        self.auto_refresh_label.setText("โ ๏ธ No recent runtime state")
+                        self.auto_refresh_label.setText("No recent runtime state")
                         self.auto_refresh_label.setStyleSheet("color: orange; font-weight: bold;")
             except Exception as e:
                 logger.warning(f"Failed to read dashboard state: {e}")
@@ -1630,6 +2023,188 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.resolve())))
 
+    def _relaunch_app(self):
+        """Spawn a detached relauncher that restarts the controller after this one exits."""
+        try:
+            root = self._project_root()
+            relauncher = root / 'scripts' / 'relaunch_controller.py'
+            kwargs = {}
+            if sys.platform.startswith('win'):
+                # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                kwargs['creationflags'] = 0x00000008 | 0x00000200
+            subprocess.Popen(
+                [sys.executable, str(relauncher), str(os.getpid()), str(root)],
+                cwd=str(root), close_fds=True, **kwargs)
+            logger.info('Relauncher spawned; closing controller for update restart')
+            QTimer.singleShot(500, self.close)
+        except Exception as e:
+            logger.error(f'Failed to relaunch after update: {e}')
+            QMessageBox.warning(self, 'Restart needed',
+                                f'Update applied, but auto-restart failed. Please restart manually.\n{e}')
+
+    def _updates_cfg(self) -> dict:
+        cfg = CONFIG.get('updates', {})
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _current_version(self) -> str:
+        return read_version_file(self._project_root()) or str(CONFIG.get('version', '0') or '0')
+
+    def open_update_settings(self):
+        """Persistent GUI for the update URL + auto-update behavior (saved to config)."""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox
+        cfg = self._updates_cfg()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Update Settings")
+        dlg.setMinimumWidth(640)
+        form = QFormLayout(dlg)
+
+        url_edit = QLineEdit(str(cfg.get('metadata_url', '') or ''))
+        url_edit.setPlaceholderText(
+            "https://<proj>.supabase.co/storage/v1/object/public/app-updates/update_metadata.json")
+        form.addRow("Update URL (metadata JSON):", url_edit)
+
+        startup_chk = QCheckBox("Check for updates automatically on startup")
+        startup_chk.setChecked(bool(cfg.get('auto_check_on_startup', False)))
+        form.addRow(startup_chk)
+
+        auto_chk = QCheckBox("Install updates automatically — no prompt, app restarts")
+        auto_chk.setChecked(bool(cfg.get('auto_install', False)))
+        form.addRow(auto_chk)
+
+        info = QLabel(f"Current version: {self._current_version()}")
+        info.setStyleSheet("color:#6B6B64;")
+        form.addRow(info)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_cfg = dict(cfg)
+        new_cfg['metadata_url'] = url_edit.text().strip()
+        new_cfg['auto_check_on_startup'] = startup_chk.isChecked()
+        new_cfg['auto_install'] = auto_chk.isChecked()
+        new_cfg.setdefault('download_dir', cfg.get('download_dir', 'updates'))
+        try:
+            CONFIG['updates'] = new_cfg
+            CONFIG.save()
+            QMessageBox.information(self, "Update Settings", "Saved.")
+        except Exception as e:
+            QMessageBox.critical(self, "Update Settings", f"Could not save settings: {e}")
+
+    def _auto_check_on_startup(self):
+        cfg = self._updates_cfg()
+        if not cfg.get('auto_check_on_startup'):
+            return
+        if not str(cfg.get('metadata_url', '') or '').strip():
+            return
+        self._start_update_worker(do_download=bool(cfg.get('auto_install', False)))
+
+    def _setup_periodic_update_check(self):
+        """Start a repeating timer that re-checks for updates every N hours.
+
+        Controlled by `updates.check_interval_hours` (default 24). Independent of the
+        startup check; set to 0 to disable periodic checks. Needs a metadata_url. When
+        auto_install is on, a found update downloads + applies + restarts the app.
+        """
+        cfg = self._updates_cfg()
+        try:
+            hours = float(cfg.get('check_interval_hours', 24) or 0)
+        except (TypeError, ValueError):
+            hours = 24.0
+        if hours <= 0:
+            logger.info("Periodic update check disabled (check_interval_hours<=0)")
+            return
+        if not str(cfg.get('metadata_url', '') or '').strip():
+            return
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.timeout.connect(self._periodic_update_check)
+        self._update_check_timer.start(int(hours * 3600 * 1000))
+        logger.info("Periodic update check scheduled every %.1fh", hours)
+
+    def _periodic_update_check(self):
+        cfg = self._updates_cfg()
+        if not str(cfg.get('metadata_url', '') or '').strip():
+            return
+        logger.info("Periodic update check firing")
+        self._start_update_worker(do_download=bool(cfg.get('auto_install', False)))
+
+    def _auto_start_service_on_boot(self):
+        """Start counting automatically on an unattended boot.
+
+        Triggered by --autostart (HGCC_AUTOSTART=1, set by the Startup launcher) or the
+        persistent `auto_start_service` config flag. No-op if the service is already
+        running (e.g. the operator clicked Start), so it can never double-spawn runtimes.
+        """
+        env_on = os.environ.get("HGCC_AUTOSTART", "").strip().lower() in ("1", "true", "yes")
+        cfg_on = bool(self.config.get("auto_start_service", False))
+        if not (env_on or cfg_on):
+            return
+        if getattr(self, "is_running", False):
+            logger.info("Auto-start skipped: service already running")
+            return
+        logger.info("Auto-starting runtime service on boot (autostart=%s, config=%s)", env_on, cfg_on)
+        try:
+            self.start_service()
+        except Exception:
+            logger.exception("Auto-start of runtime service failed")
+
+    def _start_update_worker(self, do_download: bool):
+        if getattr(self, '_update_worker', None) is not None and self._update_worker.isRunning():
+            return
+        url = str(self._updates_cfg().get('metadata_url', '') or '').strip()
+        if not url:
+            return
+        self.statusBar().showMessage("Checking for updates...")
+        cfg_data = CONFIG.data if hasattr(CONFIG, 'data') else CONFIG
+        self._update_worker = _UpdateWorker(cfg_data, url, self._current_version(), do_download)
+        self._update_worker.done.connect(self._on_update_worker_done)
+        self._update_worker.start()
+
+    def _on_update_worker_done(self, result: dict):
+        status = result.get('status')
+        if status == 'uptodate':
+            self.statusBar().showMessage(f"Up to date (v{self._current_version()})", 5000)
+            return
+        if status == 'error':
+            self.statusBar().showMessage(f"Update check failed: {result.get('error')}", 8000)
+            return
+        if status == 'available':
+            v = result.get('version')
+            self.statusBar().showMessage(f"Update v{v} available — click 'Install Update'", 0)
+            QMessageBox.information(
+                self, "Update available",
+                f"Version {v} is available.\n{result.get('notes') or ''}\n\n"
+                "Click 'Check Updates' then 'Install Update' to apply, "
+                "or enable auto-install in Update Settings.")
+            return
+        if status == 'ready':
+            v = result.get('version')
+            self.statusBar().showMessage(f"Installing update v{v}...", 0)
+            self._auto_apply_update(Path(result.get('path')), v)
+
+    def _auto_apply_update(self, archive_path: Path, version):
+        """Apply an already downloaded+verified update archive, then restart."""
+        try:
+            if getattr(self, 'is_running', False):
+                self.stop_service()
+            if getattr(sys, 'frozen', False):
+                from shared.self_update import apply_frozen_update
+                apply_frozen_update(archive_path)
+                QMessageBox.information(self, "Updating",
+                    f"Updating to v{version}. The app will close, update, and reopen.")
+                QTimer.singleShot(500, self.close)
+                return
+            updater = Updater(CONFIG.data if hasattr(CONFIG, 'data') else CONFIG)
+            updater.install_code_update(archive_path, project_root=self._project_root(), version=str(version))
+            logger.info(f"Auto-update v{version} applied; relaunching")
+            self._relaunch_app()
+        except Exception as e:
+            logger.error(f"Auto-update failed: {e}")
+            self.statusBar().showMessage(f"Auto-update failed: {e}", 8000)
+
     def check_updates(self):
         """Check remote metadata, download & verify primary asset, and stage it under `updates/`.
 
@@ -1649,6 +2224,12 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             self.statusBar().showMessage('Checking for updates...')
             metadata = updater.check_for_update(metadata_url)
             version, notes = updater.inspect_metadata_for_update(metadata)
+            current_version = read_version_file(self._project_root()) or str(CONFIG.get('version', '0') or '0')
+            if version and not is_newer(version, current_version):
+                QMessageBox.information(self, 'Up to date',
+                    f'Already on the latest version (current {current_version}, latest {version}).')
+                self.statusBar().showMessage('Already up to date', 5000)
+                return
             asset = updater.select_primary_asset(metadata)
             if not asset:
                 QMessageBox.information(self, 'No Update', 'No downloadable assets found in metadata.')
@@ -1701,24 +2282,42 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
                 QMessageBox.critical(self, 'Not found', f'Selected file not found: {chosen}')
                 return
 
-            # If archive, offer atomic deploy
+            # If archive, perform a SAFE code-only update (preserves venv/data/models/config).
             if chosen.suffix.lower() in ['.zip', '.tar', '.gz', '.bz2']:
-                reply = QMessageBox.question(self, 'Install Update', f'Detected archive {chosen.name}. Perform atomic deploy?', QMessageBox.Yes | QMessageBox.No)
+                reply = QMessageBox.question(self, 'Install Update',
+                    f'Install code update from {chosen.name}?\n\n'
+                    'Only application code is replaced. The venv, data, models and config are '
+                    'preserved and the replaced code is backed up. The controller restarts afterward.',
+                    QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
+                    if getattr(sys, 'frozen', False):
+                        # Frozen .exe: can't overwrite running files -> swap the whole
+                        # onedir install via an external helper, then relaunch.
+                        try:
+                            from shared.self_update import apply_frozen_update
+                            if self.is_running:
+                                self.stop_service()
+                            apply_frozen_update(chosen)
+                            QMessageBox.information(self, 'Updating',
+                                'The app will now close, update itself, and reopen automatically.')
+                            QTimer.singleShot(500, self.close)
+                        except Exception as e:
+                            QMessageBox.critical(self, 'Update Failed', f'Self-update failed: {e}')
+                        return
                     try:
                         updater = Updater(CONFIG.data if hasattr(CONFIG, 'data') else CONFIG)
                         root = self._project_root()
-                        # stop runtime service before deploying
-                        was_running = self.is_running
-                        if was_running:
+                        if self.is_running:
                             self.stop_service()
-                        deployed = updater.install_update_atomic(chosen, deploy_target=root)
-                        QMessageBox.information(self, 'Deployed', f'Update deployed to: {deployed}')
-                        # restart runtime service if it was running
-                        if was_running:
-                            self.start_service()
+                        result = updater.install_code_update(
+                            chosen, project_root=root, version=str(CONFIG.get('version', '')))
+                        QMessageBox.information(self, 'Update applied',
+                            'Updated: ' + ', '.join(result.get('copied') or ['(nothing)']) +
+                            (f"\nBackup: {result['backup']}" if result.get('backup') else '') +
+                            '\n\nThe controller will now restart.')
+                        self._relaunch_app()
                     except Exception as e:
-                        QMessageBox.critical(self, 'Deploy Failed', f'Atomic deploy failed: {e}')
+                        QMessageBox.critical(self, 'Update Failed', f'Code update failed: {e}')
                     return
 
             reply = QMessageBox.question(self, 'Install Update', f'Run installer: {chosen.name}?', QMessageBox.Yes | QMessageBox.No)
@@ -2602,19 +3201,19 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
                 models = [m["name"] for m in data.get("models", [])]
                 if models:
                     target = next((m for m in models if "llava" in m or "llama3" in m), models[0])
-                    self.status_ai_model.setText(f"AI: ๐ข {target}")
+                    self.status_ai_model.setText(f"AI: {target}")
                     self.status_ai_model.setStyleSheet("color: green; font-weight: bold;")
                 else:
-                    self.status_ai_model.setText("AI: ๐”ด No Models")
+                    self.status_ai_model.setText("AI: No Models")
                     self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
         except Exception:
-             self.status_ai_model.setText("AI: ๐”ด Offline (YOLO Only)")
+             self.status_ai_model.setText("AI: Offline (YOLO Only)")
              self.status_ai_model.setStyleSheet("color: red; font-weight: bold;")
 
     def tab_llm(self):
         from controller.llm_evaluation_ui import LLMEvaluationWidget
         self.llm_tab_widget = LLMEvaluationWidget()
-        self.tabs.addTab(self.llm_tab_widget, "๐ค– AI Evaluation")
+        self.tabs.addTab(self.llm_tab_widget, "AI Evaluation")
         
     def tab_cloud_sync(self):
         from controller.cloud_sync_widget import CloudSyncWidget
@@ -2622,13 +3221,32 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         cloud_scroll = QScrollArea()
         cloud_scroll.setWidgetResizable(True)
         cloud_scroll.setWidget(self.cloud_sync_widget)
-        self.tabs.addTab(cloud_scroll, "☁️ Cloud Sync")
+        self.tabs.addTab(cloud_scroll, "Cloud Sync")
 # =========================
 # MAIN
 # =========================
 
 def main():
+    # Unattended boot launch (Startup-folder shortcut passes --autostart): mark the
+    # environment so the login gate skips the human PIN (machine binding still checked)
+    # and the dashboard auto-starts counting after it opens.
+    if "--autostart" in sys.argv:
+        os.environ["HGCC_AUTOSTART"] = "1"
+    # Windows: a distinct AppUserModelID makes the taskbar show our icon (not pythonw's)
+    # and group the windows under the app.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HuaGruay.CameraCounter.Controller")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    _icon = _app_icon_path()
+    if _icon:
+        app.setWindowIcon(QIcon(_icon))
+    apply_theme(app)
+    if not run_login_gate(CONFIG):
+        sys.exit(0)
     controller = MainController()
     controller.show()
     sys.exit(app.exec())
