@@ -325,6 +325,11 @@ class MainController(QMainWindow):
         # Optional silent auto-check for updates shortly after launch (opt-in via config).
         self._update_worker = None
         QTimer.singleShot(4000, self._auto_check_on_startup)
+
+        # Optionally start counting automatically after the dashboard opens, so a branch
+        # PC resumes unattended after a reboot/power cut. Enabled by --autostart at boot
+        # (HGCC_AUTOSTART=1) or the persistent `auto_start_service` config flag.
+        QTimer.singleShot(7000, self._auto_start_service_on_boot)
     
     def _kpi_card(self, title: str, attr: str) -> QFrame:
         frame = QFrame()
@@ -1900,6 +1905,26 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             return
         self._start_update_worker(do_download=bool(cfg.get('auto_install', False)))
 
+    def _auto_start_service_on_boot(self):
+        """Start counting automatically on an unattended boot.
+
+        Triggered by --autostart (HGCC_AUTOSTART=1, set by the Startup launcher) or the
+        persistent `auto_start_service` config flag. No-op if the service is already
+        running (e.g. the operator clicked Start), so it can never double-spawn runtimes.
+        """
+        env_on = os.environ.get("HGCC_AUTOSTART", "").strip().lower() in ("1", "true", "yes")
+        cfg_on = bool(self.config.get("auto_start_service", False))
+        if not (env_on or cfg_on):
+            return
+        if getattr(self, "is_running", False):
+            logger.info("Auto-start skipped: service already running")
+            return
+        logger.info("Auto-starting runtime service on boot (autostart=%s, config=%s)", env_on, cfg_on)
+        try:
+            self.start_service()
+        except Exception:
+            logger.exception("Auto-start of runtime service failed")
+
     def _start_update_worker(self, do_download: bool):
         if getattr(self, '_update_worker', None) is not None and self._update_worker.isRunning():
             return
@@ -2976,6 +3001,11 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
 # =========================
 
 def main():
+    # Unattended boot launch (Startup-folder shortcut passes --autostart): mark the
+    # environment so the login gate skips the human PIN (machine binding still checked)
+    # and the dashboard auto-starts counting after it opens.
+    if "--autostart" in sys.argv:
+        os.environ["HGCC_AUTOSTART"] = "1"
     app = QApplication(sys.argv)
     apply_theme(app)
     if not run_login_gate(CONFIG):

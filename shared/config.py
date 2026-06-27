@@ -192,6 +192,10 @@ class Config:
             "project_name": "HG Camera Counter",
             "version": "0.2.0",
             "branch_code": os.getenv("BRANCH_CODE", "DEMO"),
+            # When true, the dashboard auto-starts counting shortly after it opens
+            # (unattended boot recovery). The Startup launcher also passes --autostart
+            # which both enables this and skips the PIN on the machine-bound device.
+            "auto_start_service": False,
             "supabase": {
                 "url": os.getenv("SUPABASE_URL", ""),
                 "key": os.getenv("SUPABASE_ANON_KEY", ""),

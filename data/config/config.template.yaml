@@ -7,6 +7,11 @@ project_name: "HG Camera Counter"
 version: "0.2.0"
 branch_code: "${BRANCH_CODE:DEMO}"  # Or set BRANCH_CODE env var
 
+# Unattended boot recovery: start counting automatically when the dashboard opens.
+# Pair with the Startup-folder shortcut (scripts/install_autostart.ps1) which passes
+# --autostart so the PIN is skipped on this (machine-bound) device after a power cut.
+auto_start_service: false
+
 # Supabase Configuration
 supabase:
   url: "${SUPABASE_URL:}"           # Or set SUPABASE_URL env var
