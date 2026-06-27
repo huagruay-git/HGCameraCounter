@@ -35,6 +35,62 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Public-manifest model updates (no device-token RPC needed).
+# A models manifest is a JSON file in a PUBLIC bucket listing downloadable model
+# versions; the GUI lists them and the operator picks one to download + apply.
+#   { "models": [ { "version", "name", "url", "sha256", "size", "notes",
+#                   "recommended": bool, "created" }, ... ] }
+# ---------------------------------------------------------------------------
+def installed_model_version(model_path) -> str:
+    """Return the version recorded next to the local model file ('' if unknown)."""
+    try:
+        return Path(str(model_path) + ".version").read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def fetch_model_manifest(url: str, timeout: int = 30) -> dict:
+    """GET + parse the public models manifest JSON. Raises on network/parse error."""
+    req = urllib.request.Request(url, headers={"User-Agent": "hgcc-model-ota"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    if isinstance(data, list):
+        data = {"models": data}
+    return data if isinstance(data, dict) else {"models": []}
+
+
+def apply_model_from_entry(entry: dict, dest_path, logger=None) -> str:
+    """Download entry['url'], verify sha256 (if given), back up + swap into dest_path,
+    and write the version marker. Returns the applied version. Raises on failure.
+    The new model takes effect on the next runtime restart."""
+    dest = Path(dest_path)
+    version = str(entry.get("version") or "").strip()
+    url = str(entry.get("url") or "").strip()
+    if not version or not url:
+        raise ValueError("manifest entry missing 'version' or 'url'")
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="model_dl_"))
+    tmp = tmpdir / (dest.name or "best.pt")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "hgcc-model-ota"})
+        with urllib.request.urlopen(req, timeout=600) as r, open(tmp, "wb") as fd:
+            shutil.copyfileobj(r, fd)
+        expected = str(entry.get("sha256") or "").strip()
+        if expected and _sha256(tmp).lower() != expected.lower():
+            raise ValueError("sha256 mismatch (download rejected)")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            shutil.copy2(dest, Path(str(dest) + ".bak"))
+        shutil.move(str(tmp), str(dest))
+        Path(str(dest) + ".version").write_text(version, encoding="utf-8")
+        if logger is not None:
+            logger.info("Model applied -> %s (active on next runtime restart)", version)
+        return version
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 class ModelOTA:
     def __init__(self, rpc_client, device_token: str, local_model_path, override_path,
                  logger=None, dry_run: bool = False):

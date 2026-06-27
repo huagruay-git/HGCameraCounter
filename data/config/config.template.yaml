@@ -29,6 +29,12 @@ updates:
   auto_check_on_startup: false  # true = silently check for updates ~4s after launch
   check_interval_hours: 24      # re-check every N hours while running (0 = only at startup)
 
+# AI model updates: the "อัปเดตโมเดล" tab lists model versions from a PUBLIC manifest
+# and downloads+applies the one you pick (replaces yolo.worker_model/model). The company
+# publishes versions with scripts/upload_model.py. The new model applies on next Start.
+models:
+  manifest_url: ""  # HTTPS URL to models_manifest.json in a public bucket (empty = off)
+
 # Liveness watchdog (auto-reboot the PC if the counting runtime freezes/dies).
 # Separate process started at boot by Task Scheduler — see scripts/install_watchdog_task.ps1.
 # It watches runtime/dashboard_state.json (refreshed <=10s while the live agent is

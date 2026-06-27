@@ -196,6 +196,10 @@ class Config:
             # (unattended boot recovery). The Startup launcher also passes --autostart
             # which both enables this and skips the PIN on the machine-bound device.
             "auto_start_service": False,
+            # AI model updates pulled from a public manifest (the "อัปเดตโมเดล" tab).
+            "models": {
+                "manifest_url": os.getenv("MODELS_MANIFEST_URL", ""),
+            },
             "supabase": {
                 "url": os.getenv("SUPABASE_URL", ""),
                 "key": os.getenv("SUPABASE_ANON_KEY", ""),

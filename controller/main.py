@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QDoubleSpinBox, QComboBox, QLineEdit,
     QFormLayout, QGroupBox, QProgressBar, QTableWidget, QTableWidgetItem,
     QCheckBox, QScrollArea, QFrame, QGridLayout,
-    QHeaderView
+    QHeaderView, QAbstractItemView
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QSize
 from PySide6.QtGui import QIcon, QFont, QColor, QDesktopServices, QImage, QPixmap
@@ -193,6 +193,32 @@ class _UpdateWorker(QThread):
             self.done.emit({"status": "error", "error": str(e)})
 
 
+class _ModelOTAWorker(QThread):
+    """Background model-update worker: fetch the public manifest, or download+apply one."""
+    done = Signal(dict)
+
+    def __init__(self, op: str, payload, dest=None):
+        super().__init__()
+        self._op = op            # 'list' | 'apply'
+        self._payload = payload  # manifest url (list) | manifest entry dict (apply)
+        self._dest = dest        # local model path (apply)
+
+    def run(self):
+        try:
+            from runtime.model_ota import fetch_model_manifest, apply_model_from_entry
+            if self._op == "list":
+                man = fetch_model_manifest(str(self._payload))
+                models = man.get("models", []) if isinstance(man, dict) else []
+                self.done.emit({"status": "list", "models": models})
+            elif self._op == "apply":
+                version = apply_model_from_entry(self._payload, self._dest)
+                self.done.emit({"status": "applied", "version": version})
+            else:
+                self.done.emit({"status": "error", "error": f"unknown op {self._op}"})
+        except Exception as e:
+            self.done.emit({"status": "error", "error": str(e), "op": self._op})
+
+
 class MainController(QMainWindow):
     """Main Controller Application"""
     
@@ -334,6 +360,7 @@ class MainController(QMainWindow):
         self.tab_logs()
         self.tab_model_train()
         self.tab_model_test()
+        self.tab_model_updates()
         self.tab_dataset_lab()
         
         layout.addWidget(self.tabs)
@@ -1177,6 +1204,149 @@ class MainController(QMainWindow):
 
         widget.setLayout(layout)
         self.tabs.addTab(widget, "Model Test")
+
+    # ------------------------------------------------------------------
+    # Model Updates (download a model version from the public manifest)
+    # ------------------------------------------------------------------
+    def _models_cfg(self) -> dict:
+        cfg = CONFIG.get('models', {})
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _local_model_path(self) -> Path:
+        root = self._project_root()
+        models_dir = self.config.get('paths', {}).get('models', 'models')
+        yolo = self.config.get('yolo', {}) or {}
+        name = yolo.get('worker_model') or yolo.get('model') or 'best.pt'
+        return root / models_dir / name
+
+    def _refresh_installed_model_label(self):
+        from runtime.model_ota import installed_model_version
+        p = self._local_model_path()
+        ver = installed_model_version(p) or "(ไม่ทราบเวอร์ชัน)"
+        state = "มีไฟล์" if p.exists() else "ยังไม่มีไฟล์"
+        self.model_installed_label.setText(f"โมเดลปัจจุบัน: {p.name} — เวอร์ชัน {ver} ({state})")
+
+    def tab_model_updates(self):
+        """List model versions from the public manifest and download+apply one."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        title = QLabel("อัปเดตโมเดล AI")
+        tf = QFont(); tf.setPointSize(14); tf.setBold(True); title.setFont(tf)
+        layout.addWidget(title)
+
+        self.model_installed_label = QLabel("")
+        layout.addWidget(self.model_installed_label)
+
+        row = QHBoxLayout()
+        self.model_refresh_btn = QPushButton("รีเฟรชรายการ")
+        self.model_refresh_btn.clicked.connect(self._refresh_model_list)
+        self.model_apply_btn = QPushButton("ดาวน์โหลด + ใช้งานที่เลือก")
+        self.model_apply_btn.setEnabled(False)
+        self.model_apply_btn.clicked.connect(self._apply_selected_model)
+        row.addWidget(self.model_refresh_btn)
+        row.addWidget(self.model_apply_btn)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self.model_table = QTableWidget(0, 5)
+        self.model_table.setHorizontalHeaderLabels(["เวอร์ชัน", "วันที่", "หมายเหตุ", "แนะนำ", "สถานะ"])
+        self.model_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.model_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.model_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.model_table.horizontalHeader().setStretchLastSection(True)
+        self.model_table.itemSelectionChanged.connect(
+            lambda: self.model_apply_btn.setEnabled(self.model_table.currentRow() >= 0))
+        layout.addWidget(self.model_table)
+
+        self.model_status_label = QLabel("")
+        self.model_status_label.setStyleSheet("color:#6B6B64;")
+        layout.addWidget(self.model_status_label)
+
+        self._model_entries = []
+        self._model_worker = None
+        self._refresh_installed_model_label()
+        self.tabs.addTab(widget, "อัปเดตโมเดล")
+
+        if str(self._models_cfg().get('manifest_url', '') or '').strip():
+            QTimer.singleShot(1500, self._refresh_model_list)
+        else:
+            self.model_status_label.setText("ยังไม่ได้ตั้งค่า models.manifest_url ใน config")
+
+    def _refresh_model_list(self):
+        url = str(self._models_cfg().get('manifest_url', '') or '').strip()
+        if not url:
+            self.model_status_label.setText("ยังไม่ได้ตั้งค่า models.manifest_url ใน config")
+            return
+        if getattr(self, '_model_worker', None) is not None and self._model_worker.isRunning():
+            return
+        self.model_status_label.setText("กำลังดึงรายการโมเดล...")
+        self.model_refresh_btn.setEnabled(False)
+        self._model_worker = _ModelOTAWorker('list', url)
+        self._model_worker.done.connect(self._on_model_worker_done)
+        self._model_worker.start()
+
+    def _apply_selected_model(self):
+        rowi = self.model_table.currentRow()
+        if rowi < 0 or rowi >= len(self._model_entries):
+            return
+        entry = self._model_entries[rowi]
+        ver = entry.get('version', '?')
+        if QMessageBox.question(
+                self, "ยืนยัน",
+                f"ดาวน์โหลดและใช้งานโมเดลเวอร์ชัน {ver}?\n"
+                "โมเดลเดิมจะถูกสำรองเป็น .bak และจะมีผลเมื่อ Stop → Start Service"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        if getattr(self, '_model_worker', None) is not None and self._model_worker.isRunning():
+            return
+        self.model_status_label.setText(f"กำลังดาวน์โหลดเวอร์ชัน {ver}...")
+        self.model_apply_btn.setEnabled(False)
+        self.model_refresh_btn.setEnabled(False)
+        self._model_worker = _ModelOTAWorker('apply', entry, str(self._local_model_path()))
+        self._model_worker.done.connect(self._on_model_worker_done)
+        self._model_worker.start()
+
+    def _populate_model_table(self, models):
+        from runtime.model_ota import installed_model_version
+        cur = installed_model_version(self._local_model_path())
+        self.model_table.setRowCount(0)
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            r = self.model_table.rowCount()
+            self.model_table.insertRow(r)
+            ver = str(m.get('version', ''))
+            self.model_table.setItem(r, 0, QTableWidgetItem(ver))
+            self.model_table.setItem(r, 1, QTableWidgetItem(str(m.get('created', ''))))
+            self.model_table.setItem(r, 2, QTableWidgetItem(str(m.get('notes', ''))))
+            self.model_table.setItem(r, 3, QTableWidgetItem("★ แนะนำ" if m.get('recommended') else ""))
+            self.model_table.setItem(r, 4, QTableWidgetItem("● ใช้อยู่" if ver and ver == cur else ""))
+        self.model_table.resizeColumnsToContents()
+
+    def _on_model_worker_done(self, result: dict):
+        self.model_refresh_btn.setEnabled(True)
+        status = result.get('status')
+        if status == 'list':
+            self._model_entries = [m for m in (result.get('models') or []) if isinstance(m, dict)]
+            self._populate_model_table(self._model_entries)
+            self.model_status_label.setText(f"พบ {len(self._model_entries)} เวอร์ชัน")
+        elif status == 'applied':
+            self._refresh_installed_model_label()
+            self._populate_model_table(self._model_entries)
+            self.model_status_label.setText(
+                f"ติดตั้งเวอร์ชัน {result.get('version')} แล้ว — Stop → Start Service เพื่อใช้งาน")
+            QMessageBox.information(
+                self, "สำเร็จ",
+                f"ติดตั้งโมเดลเวอร์ชัน {result.get('version')} แล้ว\n"
+                "กด Stop Service แล้ว Start Service เพื่อให้มีผล")
+        elif status == 'error':
+            err = str(result.get('error') or '')
+            if result.get('op') == 'list' and ('404' in err or 'Not Found' in err):
+                self.model_status_label.setText("ยังไม่มีโมเดลเผยแพร่บน Supabase (บริษัทยังไม่ได้อัป)")
+            else:
+                self.model_status_label.setText(f"ผิดพลาด: {err}")
+                QMessageBox.warning(self, "ผิดพลาด", f"ทำงานไม่สำเร็จ:\n{err}")
 
     def _metric_row_widget(self, label: QLabel, bar: QProgressBar) -> QWidget:
         w = QWidget()
