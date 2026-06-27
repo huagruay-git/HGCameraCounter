@@ -67,7 +67,8 @@ $sc.Arguments        = 'controller\main.py --autostart'
 $sc.WorkingDirectory = $root
 $sc.WindowStyle      = 1
 $sc.Description      = 'HG Camera Counter - auto-start counting at logon'
-$sc.IconLocation     = "$pyExe,0"
+$appIcon = Join-Path $root 'assets\app_icon.ico'
+if (Test-Path $appIcon) { $sc.IconLocation = "$appIcon,0" } else { $sc.IconLocation = "$pyExe,0" }
 $sc.Save()
 
 Write-Host "Installed auto-start shortcut:" -ForegroundColor Green

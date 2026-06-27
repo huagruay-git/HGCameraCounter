@@ -22,6 +22,8 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+SetupIconFile=assets\app_icon.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -33,6 +35,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; PyInstaller onedir output (HGCameraCounter.exe + _internal with torch/ultralytics/PySide6)
 Source: "dist\HGCameraCounter\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 ; Runtime assets that live next to the exe (the frozen app uses the exe dir as project root)
+Source: "assets\*"; DestDir: "{app}\assets"; Flags: recursesubdirs ignoreversion skipifsourcedoesntexist
 Source: "models\*.pt"; DestDir: "{app}\models"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "tools\ffmpeg\*"; DestDir: "{app}\tools\ffmpeg"; Excludes: "*.zip,doc\*"; Flags: recursesubdirs ignoreversion skipifsourcedoesntexist
 Source: "data\zones\*"; DestDir: "{app}\data\zones"; Flags: recursesubdirs ignoreversion skipifsourcedoesntexist
@@ -41,9 +44,9 @@ Source: "data\zones\*"; DestDir: "{app}\data\zones"; Flags: recursesubdirs ignor
 Source: "data\config\config.template.yaml"; DestDir: "{app}\data\config"; Flags: skipifsourcedoesntexist onlyifdoesntexist
 
 [Icons]
-Name: "{group}\HG Camera Counter"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\HG Camera Counter"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\app_icon.ico"
 Name: "{group}\Uninstall HG Camera Counter"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\HG Camera Counter"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\HG Camera Counter"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\app_icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

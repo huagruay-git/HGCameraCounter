@@ -60,6 +60,24 @@ CONFIG = Config("data/config/config.yaml")
 logger = setup_logger("controller", CONFIG.get("paths", {}).get("logs", "logs"))
 
 
+def _app_icon_path() -> str:
+    """Resolve the HUAGRUAY app icon (assets/), for both source and frozen builds."""
+    bases = []
+    if getattr(sys, "frozen", False):
+        bases.append(Path(sys.executable).resolve().parent)   # shipped next to the exe
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            bases.append(Path(meipass))                        # bundled inside the build
+    else:
+        bases.append(Path(__file__).resolve().parent.parent)
+    for base in bases:
+        for name in ("app_icon.ico", "app_icon.png"):
+            p = base / "assets" / name
+            if p.exists():
+                return str(p)
+    return ""
+
+
 class CommandWorker(QObject):
     """Run subprocess command without blocking the UI thread."""
     output = Signal(str)
@@ -211,6 +229,9 @@ class MainController(QMainWindow):
         self.camera_manager = CameraManagerWidget(self)
         
         self.setWindowTitle("HG Camera Counter - Controller")
+        _icon = _app_icon_path()
+        if _icon:
+            self.setWindowIcon(QIcon(_icon))
         self.setGeometry(100, 100, 1200, 800)
         
         # Setup UI
@@ -3041,7 +3062,18 @@ def main():
     # and the dashboard auto-starts counting after it opens.
     if "--autostart" in sys.argv:
         os.environ["HGCC_AUTOSTART"] = "1"
+    # Windows: a distinct AppUserModelID makes the taskbar show our icon (not pythonw's)
+    # and group the windows under the app.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HuaGruay.CameraCounter.Controller")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    _icon = _app_icon_path()
+    if _icon:
+        app.setWindowIcon(QIcon(_icon))
     apply_theme(app)
     if not run_login_gate(CONFIG):
         sys.exit(0)

@@ -33,6 +33,13 @@ try:
 except Exception:
     pass
 
+# App icon: bundle it (so the runtime QIcon finds it via _MEIPASS) and embed it in the exe.
+_ICON = ROOT / "assets" / "app_icon.ico"
+for _name in ("app_icon.ico", "app_icon.png"):
+    _p = ROOT / "assets" / _name
+    if _p.exists():
+        datas += [(str(_p), "assets")]
+
 a = Analysis(
     [str(ROOT / "packaging" / "launcher.py")],
     pathex=[str(ROOT)],
@@ -58,6 +65,7 @@ exe = EXE(
     console=True,          # keep console while validating; flip to False for release
     disable_windowed_traceback=False,
     argv_emulation=False,
+    icon=(str(_ICON) if _ICON.exists() else None),
 )
 coll = COLLECT(
     exe, a.binaries, a.datas,
