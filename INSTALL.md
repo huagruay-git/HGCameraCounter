@@ -5,7 +5,26 @@
 
 ---
 
-## ขั้นที่ 1 — เอาโค้ดลงเครื่อง
+## ⚡ วิธีเร็วสุด — คำสั่งเดียวจบ (ตั้งแต่เครื่องเปล่า)
+
+เปิด **PowerShell** (ไม่ต้องลง Git/Python มาก่อน) วางคำสั่งนี้บรรทัดเดียว:
+
+```powershell
+winget install -e --id Git.Git --accept-package-agreements --accept-source-agreements --disable-interactivity; $env:Path=[Environment]::GetEnvironmentVariable('Path','Machine')+';'+[Environment]::GetEnvironmentVariable('Path','User'); git clone https://github.com/huagruay-git/HGCameraCounter.git C:\HGCameraCounter; cd C:\HGCameraCounter; .\setup.bat
+```
+
+มันจะ: ลง Git → clone repo → รัน `setup.bat` (ลง Python 3.11 + ไลบรารี + ffmpeg + autostart) ให้ครบ
+
+> ระหว่างทางจะมี **2 ป๊อปอัปที่ต้องกด** (ครั้งเดียว): UAC ตอนลงโปรแกรม (กด Yes) และ
+> หน้า **login GitHub** ตอน clone (repo เป็นส่วนตัว) — หลังจากนั้นรันยาวจนจบเอง
+
+เสร็จแล้วทำต่อ **ขั้นที่ 3** (ใส่โมเดล + ตั้งค่า) และ **ขั้นที่ 4** (BIOS + auto-login) ด้านล่าง
+
+> มี `bootstrap.ps1` ในโปรเจกต์ที่ทำงานเดียวกันนี้ (มีออปชัน `-Dir`, `-Branch`, `-Watchdog`)
+
+---
+
+## ขั้นที่ 1 — เอาโค้ดลงเครื่อง (วิธีปกติ ถ้าไม่ใช้คำสั่งเดียวด้านบน)
 
 เลือกวิธีใดวิธีหนึ่ง (repo เป็นส่วนตัว ต้อง login GitHub):
 
