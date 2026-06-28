@@ -846,6 +846,21 @@ class MainController(QMainWindow):
         title.setFont(title_font)
         layout.addWidget(title)
         
+        # Prominent auto-discover: scan the network for cameras/NVRs of any brand
+        # (Imou / Hikvision / FNK / ONVIF ...) and add them without typing RTSP URLs.
+        discover_row = QHBoxLayout()
+        discover_btn = QPushButton("🔍  ค้นหากล้องอัตโนมัติ")
+        discover_btn.setToolTip(
+            "สแกนหากล้อง/NVR ในเครือข่ายอัตโนมัติ (รองรับหลายยี่ห้อ เช่น Imou / Hikvision / FNK) "
+            "แล้วเลือกเพิ่มได้เลย — ไม่ต้องพิมพ์ URL RTSP เอง")
+        discover_btn.setStyleSheet(
+            "QPushButton{background:#F4C20D;color:#1A1A1A;font-weight:bold;padding:8px 16px;border-radius:6px;}"
+            "QPushButton:hover{background:#E0B000;}")
+        discover_btn.clicked.connect(self.camera_manager.open_lan_scanner_dialog)
+        discover_row.addWidget(discover_btn)
+        discover_row.addStretch()
+        layout.addLayout(discover_row)
+
         # Camera list
         layout.addWidget(QLabel("Configured Cameras:"))
         self.camera_list = QTreeWidget()
