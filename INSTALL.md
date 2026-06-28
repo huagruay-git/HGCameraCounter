@@ -7,20 +7,28 @@
 
 ## ⚡ วิธีเร็วสุด — คำสั่งเดียวจบ (ตั้งแต่เครื่องเปล่า)
 
-เปิด **PowerShell** (ไม่ต้องลง Git/Python มาก่อน) วางคำสั่งนี้บรรทัดเดียว:
+1. กดปุ่ม **Start** → พิมพ์ `powershell` → คลิกขวา **Windows PowerShell** → **Run as administrator** → กด **Yes**
+2. วางคำสั่งบรรทัดเดียวนี้ แล้ว Enter:
+
+```powershell
+irm https://gist.githubusercontent.com/huagruay-git/7a28954d8b28419ec911659c9838a419/raw/hgcc-install.ps1 | iex
+```
+
+มันจะ: ลง Git → clone repo → รัน `setup.bat` (ลง Python 3.11 + ไลบรารี + ffmpeg + autostart + ไอคอน) ให้ครบ
+และถ้าติดตั้งไว้แล้วจะ **อัปเดตเป็นเวอร์ชันล่าสุด** ให้ด้วย (git pull)
+
+> ระหว่างทางจะมีหน้า **login GitHub** เด้งตอน clone (repo เป็นส่วนตัว) — เซ็นอินให้เรียบร้อย
+> ถ้าเปิด PowerShell แบบ **ไม่ใช่ admin** จะมีกล่อง UAC เด้งตอนลง Git/Python ให้กด **Yes**
+
+เสร็จแล้วทำต่อ **ขั้นที่ 3** (ใส่โมเดล + ตั้งค่า) และ **ขั้นที่ 4** (BIOS + auto-login) ด้านล่าง
+
+<details><summary>ทางเลือก: พิมพ์เอง (ไม่พึ่ง gist)</summary>
 
 ```powershell
 winget install -e --id Git.Git --accept-package-agreements --accept-source-agreements --disable-interactivity; $env:Path=[Environment]::GetEnvironmentVariable('Path','Machine')+';'+[Environment]::GetEnvironmentVariable('Path','User'); git clone https://github.com/huagruay-git/HGCameraCounter.git C:\HGCameraCounter; cd C:\HGCameraCounter; .\setup.bat
 ```
-
-มันจะ: ลง Git → clone repo → รัน `setup.bat` (ลง Python 3.11 + ไลบรารี + ffmpeg + autostart) ให้ครบ
-
-> ระหว่างทางจะมี **2 ป๊อปอัปที่ต้องกด** (ครั้งเดียว): UAC ตอนลงโปรแกรม (กด Yes) และ
-> หน้า **login GitHub** ตอน clone (repo เป็นส่วนตัว) — หลังจากนั้นรันยาวจนจบเอง
-
-เสร็จแล้วทำต่อ **ขั้นที่ 3** (ใส่โมเดล + ตั้งค่า) และ **ขั้นที่ 4** (BIOS + auto-login) ด้านล่าง
-
-> มี `bootstrap.ps1` ในโปรเจกต์ที่ทำงานเดียวกันนี้ (มีออปชัน `-Dir`, `-Branch`, `-Watchdog`)
+(บรรทัดยาว — ระวังตอน copy อย่าให้ตัดบรรทัดกลางคำสั่ง) หรือใช้ `bootstrap.ps1` ในโปรเจกต์ (มี `-Dir`/`-Branch`/`-Watchdog`)
+</details>
 
 ---
 
