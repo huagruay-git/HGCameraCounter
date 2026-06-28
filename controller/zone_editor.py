@@ -75,6 +75,9 @@ class PolygonCanvas(QWidget):
         self._draw_rect = QRect(0, 0, 1, 1)
         self.polygons: List[List[QPointF]] = []
         self.current: List[QPointF] = []
+        # Called after the user drags a polygon point, so the editor can write the new
+        # positions back into its zone store (otherwise reshape edits are lost on save).
+        self.on_polygons_edited = None
         self.selected_idx = None
         self._dragging = False
         self._drag_poly: Optional[int] = None
@@ -214,6 +217,9 @@ class PolygonCanvas(QWidget):
                 self._dragging = False
                 self._drag_poly = None
                 self._drag_point = None
+            cb = getattr(self, "on_polygons_edited", None)
+            if callable(cb):
+                cb()
 
     def mouseDoubleClickEvent(self, event):
         # double-click near a point to delete it
@@ -279,6 +285,9 @@ class ZoneEditorWidget(QWidget):
         self.canvas = PolygonCanvas(self)
         self.zones: Dict[str, List[Dict]] = {}  # camera_name -> list[zones]
         self.current_camera = None
+        self._canvas_zone_index: List[int] = []
+        # Live-sync dragged points back into self.zones the moment a drag finishes.
+        self.canvas.on_polygons_edited = self._sync_canvas_edits_to_zones
 
         self.init_ui()
 
@@ -323,12 +332,34 @@ class ZoneEditorWidget(QWidget):
             self.canvas.polygons = []
             self.canvas.update()
             return
-        self.canvas.polygons = [
-            [QPointF(p[0], p[1]) for p in zone.get("points", [])]
-            for zone in self.zones.get(cam, [])
-            if len(zone.get("points", [])) >= 3
-        ]
+        polys, idx_map = [], []
+        for i, zone in enumerate(self.zones.get(cam, [])):
+            pts = zone.get("points", [])
+            if len(pts) >= 3:
+                polys.append([QPointF(p[0], p[1]) for p in pts])
+                idx_map.append(i)
+        self.canvas.polygons = polys
+        # Remember which self.zones entry each canvas polygon came from, so dragged
+        # points can be written back to the right zone on save.
+        self._canvas_zone_index = idx_map
         self.canvas.update()
+
+    def _sync_canvas_edits_to_zones(self):
+        """Write point positions edited on the canvas (dragging) back into self.zones,
+        so 'Save Zones' persists reshape edits. Maps each canvas polygon to its zone via
+        the index recorded in _refresh_canvas_polygons. Skips safely if the lists are out
+        of sync (e.g. a whole polygon was just deleted on the canvas)."""
+        cam = self.current_camera
+        if not cam or cam not in self.zones:
+            return
+        polys = getattr(self.canvas, "polygons", [])
+        idx_map = getattr(self, "_canvas_zone_index", [])
+        if len(idx_map) != len(polys):
+            return
+        zones = self.zones[cam]
+        for poly, zi in zip(polys, idx_map):
+            if 0 <= zi < len(zones) and len(poly) >= 3:
+                zones[zi]["points"] = [[p.x(), p.y()] for p in poly]
 
     def init_ui(self):
         layout = QVBoxLayout()
@@ -613,6 +644,8 @@ class ZoneEditorWidget(QWidget):
             QMessageBox.warning(self, "Error", "No camera selected/loaded")
             self._set_status("No camera selected", is_error=True)
             return
+        # Pull any on-canvas point drags into self.zones before writing the file.
+        self._sync_canvas_edits_to_zones()
         zones = self.zones.get(self.current_camera, [])
         if not zones:
             self._set_status("No zones to save", is_error=True)
