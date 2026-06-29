@@ -78,6 +78,15 @@ def _app_icon_path() -> str:
     return ""
 
 
+# Shared public models manifest (same bucket for every branch). Used by the
+# "อัปเดตโมเดล" tab when `models.manifest_url` is not set in config, so a fresh/template
+# install lists published models without per-device configuration.
+_DEFAULT_MODELS_MANIFEST_URL = (
+    "https://doafupjlqkydaoxmsqtc.supabase.co/storage/v1/object/public/"
+    "app-updates/models/models_manifest.json"
+)
+
+
 class CommandWorker(QObject):
     """Run subprocess command without blocking the UI thread."""
     output = Signal(str)
@@ -1227,6 +1236,12 @@ class MainController(QMainWindow):
         cfg = CONFIG.get('models', {})
         return cfg if isinstance(cfg, dict) else {}
 
+    def _models_manifest_url(self) -> str:
+        """The models manifest URL: config override, else the shared public manifest so
+        the อัปเดตโมเดล tab works out of the box even on a fresh/template config."""
+        return (str(self._models_cfg().get('manifest_url', '') or '').strip()
+                or _DEFAULT_MODELS_MANIFEST_URL)
+
     def _local_model_path(self) -> Path:
         root = self._project_root()
         models_dir = self.config.get('paths', {}).get('models', 'models')
@@ -1283,13 +1298,11 @@ class MainController(QMainWindow):
         self._refresh_installed_model_label()
         self.tabs.addTab(widget, "อัปเดตโมเดล")
 
-        if str(self._models_cfg().get('manifest_url', '') or '').strip():
+        if self._models_manifest_url():
             QTimer.singleShot(1500, self._refresh_model_list)
-        else:
-            self.model_status_label.setText("ยังไม่ได้ตั้งค่า models.manifest_url ใน config")
 
     def _refresh_model_list(self):
-        url = str(self._models_cfg().get('manifest_url', '') or '').strip()
+        url = self._models_manifest_url()
         if not url:
             self.model_status_label.setText("ยังไม่ได้ตั้งค่า models.manifest_url ใน config")
             return
