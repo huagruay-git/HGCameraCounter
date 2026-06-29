@@ -407,6 +407,7 @@ class MainController(QMainWindow):
         self.tab_model_train()
         self.tab_model_test()
         self.tab_model_updates()
+        self.tab_update_history()
         self.tab_dataset_lab()
         
         layout.addWidget(self.tabs)
@@ -2114,6 +2115,92 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
     def _current_version(self) -> str:
         return read_version_file(self._project_root()) or str(CONFIG.get('version', '0') or '0')
 
+    # ------------------------------------------------------------------
+    # Update history (local log of applied app updates; survives updates
+    # because it lives under data/ which is preserved by install_code_update)
+    # ------------------------------------------------------------------
+    def _update_history_path(self) -> Path:
+        return self._project_root() / "data" / "state" / "update_history.json"
+
+    def _load_update_history(self) -> list:
+        try:
+            p = self._update_history_path()
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                return data if isinstance(data, list) else []
+        except Exception:
+            pass
+        return []
+
+    def _record_update_history(self, version, notes: str = "", status: str = "applied"):
+        try:
+            p = self._update_history_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            hist = self._load_update_history()
+            hist.append({
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "version": str(version or ""),
+                "notes": str(notes or ""),
+                "status": status,
+            })
+            p.write_text(json.dumps(hist, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to record update history")
+
+    def tab_update_history(self):
+        """Show the current version + a log of updates applied on this device."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        title = QLabel("ประวัติการอัปเดตโปรแกรม")
+        tf = QFont(); tf.setPointSize(14); tf.setBold(True); title.setFont(tf)
+        layout.addWidget(title)
+
+        self.update_cur_label = QLabel("")
+        layout.addWidget(self.update_cur_label)
+
+        row = QHBoxLayout()
+        refresh_btn = QPushButton("รีเฟรช")
+        refresh_btn.clicked.connect(self._refresh_update_history_ui)
+        check_btn = QPushButton("ตรวจหาอัปเดตตอนนี้")
+        check_btn.clicked.connect(
+            lambda: self._start_update_worker(do_download=bool(self._updates_cfg().get('auto_install', False))))
+        row.addWidget(refresh_btn)
+        row.addWidget(check_btn)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self.update_hist_table = QTableWidget(0, 4)
+        self.update_hist_table.setHorizontalHeaderLabels(["วันที่/เวลา", "เวอร์ชัน", "หมายเหตุ", "สถานะ"])
+        self.update_hist_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.update_hist_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.update_hist_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.update_hist_table)
+
+        self.update_hist_empty = QLabel("")
+        self.update_hist_empty.setStyleSheet("color:#6B6B64;")
+        layout.addWidget(self.update_hist_empty)
+
+        self._refresh_update_history_ui()
+        self.tabs.addTab(widget, "ประวัติอัปเดต")
+
+    def _refresh_update_history_ui(self):
+        self.update_cur_label.setText(f"เวอร์ชันปัจจุบัน: {self._current_version()}")
+        hist = list(reversed(self._load_update_history()))  # newest first
+        self.update_hist_table.setRowCount(0)
+        for h in hist:
+            if not isinstance(h, dict):
+                continue
+            r = self.update_hist_table.rowCount()
+            self.update_hist_table.insertRow(r)
+            self.update_hist_table.setItem(r, 0, QTableWidgetItem(str(h.get("ts", ""))))
+            self.update_hist_table.setItem(r, 1, QTableWidgetItem(str(h.get("version", ""))))
+            self.update_hist_table.setItem(r, 2, QTableWidgetItem(str(h.get("notes", ""))))
+            st = str(h.get("status", ""))
+            self.update_hist_table.setItem(r, 3, QTableWidgetItem("✓ สำเร็จ" if st == "applied" else st))
+        self.update_hist_table.resizeColumnsToContents()
+        self.update_hist_empty.setText("" if hist else "ยังไม่มีประวัติการอัปเดตในเครื่องนี้")
+
     def open_update_settings(self):
         """Persistent GUI for the update URL + auto-update behavior (saved to config)."""
         from PySide6.QtWidgets import QDialog, QDialogButtonBox
@@ -2248,9 +2335,9 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         if status == 'ready':
             v = result.get('version')
             self.statusBar().showMessage(f"Installing update v{v}...", 0)
-            self._auto_apply_update(Path(result.get('path')), v)
+            self._auto_apply_update(Path(result.get('path')), v, str(result.get('notes') or ''))
 
-    def _auto_apply_update(self, archive_path: Path, version):
+    def _auto_apply_update(self, archive_path: Path, version, notes: str = ""):
         """Apply an already downloaded+verified update archive, then restart."""
         try:
             if getattr(self, 'is_running', False):
@@ -2258,16 +2345,19 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             if getattr(sys, 'frozen', False):
                 from shared.self_update import apply_frozen_update
                 apply_frozen_update(archive_path)
+                self._record_update_history(version, notes, "applied")
                 QMessageBox.information(self, "Updating",
                     f"Updating to v{version}. The app will close, update, and reopen.")
                 QTimer.singleShot(500, self.close)
                 return
             updater = Updater(CONFIG.data if hasattr(CONFIG, 'data') else CONFIG)
             updater.install_code_update(archive_path, project_root=self._project_root(), version=str(version))
+            self._record_update_history(version, notes, "applied")
             logger.info(f"Auto-update v{version} applied; relaunching")
             self._relaunch_app()
         except Exception as e:
             logger.error(f"Auto-update failed: {e}")
+            self._record_update_history(version, notes, "failed")
             self.statusBar().showMessage(f"Auto-update failed: {e}", 8000)
 
     def check_updates(self):
@@ -2376,12 +2466,14 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
                             self.stop_service()
                         result = updater.install_code_update(
                             chosen, project_root=root, version=str(CONFIG.get('version', '')))
+                        self._record_update_history(self._current_version(), f"ติดตั้งจากไฟล์ {chosen.name}", "applied")
                         QMessageBox.information(self, 'Update applied',
                             'Updated: ' + ', '.join(result.get('copied') or ['(nothing)']) +
                             (f"\nBackup: {result['backup']}" if result.get('backup') else '') +
                             '\n\nThe controller will now restart.')
                         self._relaunch_app()
                     except Exception as e:
+                        self._record_update_history(self._current_version(), f"ติดตั้งจากไฟล์ {chosen.name}", "failed")
                         QMessageBox.critical(self, 'Update Failed', f'Code update failed: {e}')
                     return
 
