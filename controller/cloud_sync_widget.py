@@ -388,6 +388,22 @@ class CloudSyncWidget(QWidget):
             self._save_config_dict(cfg)
             self.log_signal.emit("Settings saved.")
             self.status_signal.emit("Settings saved", "#1565C0")
+            # Mirror identity to %LOCALAPPDATA% (survives a reinstall) so a re-paired/
+            # re-installed device keeps the SAME device code + token instead of a new one.
+            try:
+                _tok = str(cloud_cfg.get("device_token", "") or "").strip()
+                if _tok:
+                    from shared.device_identity import save_identity
+                    save_identity({
+                        "device_token": _tok,
+                        "device_code": str(cloud_cfg.get("pair_device_code", "") or ""),
+                        "device_name": str(cloud_cfg.get("pair_device_name", "") or ""),
+                        "branch_name_reported": str(cloud_cfg.get("branch_name_reported", "") or ""),
+                        "timezone": str(cloud_cfg.get("timezone", "") or ""),
+                        "branch_code": str(cfg.get("branch_code", "") or ""),
+                    })
+            except Exception:
+                pass
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save settings: {e}")
             self.log_signal.emit(f"Failed to save settings: {e}")

@@ -29,7 +29,7 @@ from PySide6.QtGui import QIcon, QFont
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from shared.config import Config
+from shared.config import Config, LOCKED_SUPABASE_URL
 from shared.logger import setup_logger
 
 # =========================
@@ -89,10 +89,13 @@ class SetupWizard(QMainWindow):
         title.setFont(title_font)
         layout.addWidget(title)
         
-        # URL
-        layout.addWidget(QLabel("Supabase URL:"))
+        # URL — locked to the company project (read-only) so a branch can't point elsewhere
+        layout.addWidget(QLabel("Supabase URL (ล็อกไว้ ห้ามเปลี่ยน):"))
         self.sup_url_input = QLineEdit()
-        self.sup_url_input.setText(self.config.get("supabase", {}).get("url", ""))
+        self.sup_url_input.setText(LOCKED_SUPABASE_URL)
+        self.sup_url_input.setReadOnly(True)
+        self.sup_url_input.setStyleSheet("background:#EEEEEE;color:#555;")
+        self.sup_url_input.setToolTip("ล็อกไว้ที่โปรเจกต์ของบริษัท เปลี่ยนไม่ได้")
         layout.addWidget(self.sup_url_input)
         
         # Key
@@ -346,10 +349,10 @@ class SetupWizard(QMainWindow):
     
     def save_step1(self) -> bool:
         """Save Supabase settings"""
-        self.config["supabase"] = {
-            "url": self.sup_url_input.text(),
-            "key": self.sup_key_input.text(),
-        }
+        sup = dict(self.config.get("supabase", {}) or {})  # keep cloud_sync/device_token etc.
+        sup["url"] = LOCKED_SUPABASE_URL  # always the company project, never editable
+        sup["key"] = self.sup_key_input.text()
+        self.config["supabase"] = sup
         self.config["branch_code"] = self.branch_input.text()
         self.config.save()
         logger.info("Supabase settings saved")

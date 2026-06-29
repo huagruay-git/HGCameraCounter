@@ -87,6 +87,43 @@ _DEFAULT_MODELS_MANIFEST_URL = (
 )
 
 
+def _restore_device_identity() -> None:
+    """Reconnect as the SAME device after a reinstall: if this install has no device token
+    yet but a saved identity exists in %LOCALAPPDATA% (kept across reinstalls), restore the
+    token + device code/name so the branch keeps its original number — no re-pairing, no
+    duplicate device. No-op if already paired or nothing saved."""
+    try:
+        sup = CONFIG.get("supabase", {}) or {}
+        cloud = dict(sup.get("cloud_sync", {}) or {})
+        if str(cloud.get("device_token", "") or "").strip():
+            return  # already paired on this install
+        from shared.device_identity import load_identity
+        ident = load_identity()
+        token = str(ident.get("device_token", "") or "").strip()
+        if not token:
+            return  # nothing to restore
+        cloud["device_token"] = token
+        cloud["enabled"] = True
+        for src, dst in (("device_code", "pair_device_code"),
+                         ("device_name", "pair_device_name"),
+                         ("branch_name_reported", "branch_name_reported"),
+                         ("timezone", "timezone")):
+            v = str(ident.get(src, "") or "").strip()
+            if v:
+                cloud[dst] = v
+        sup = dict(sup)
+        sup["cloud_sync"] = cloud
+        CONFIG["supabase"] = sup
+        bc = str(ident.get("branch_code", "") or "").strip()
+        if bc:
+            CONFIG["branch_code"] = bc
+        CONFIG.save()
+        logger.info("Restored device identity from LOCALAPPDATA (reconnected as existing device code=%s)",
+                    cloud.get("pair_device_code", "?"))
+    except Exception:
+        logger.exception("Device identity restore failed")
+
+
 class CommandWorker(QObject):
     """Run subprocess command without blocking the UI thread."""
     output = Signal(str)
@@ -3260,6 +3297,8 @@ def main():
     # and the dashboard auto-starts counting after it opens.
     if "--autostart" in sys.argv:
         os.environ["HGCC_AUTOSTART"] = "1"
+    # Reconnect as the same device after a reinstall (restore saved token/code if unpaired).
+    _restore_device_identity()
     # Windows: a distinct AppUserModelID makes the taskbar show our icon (not pythonw's)
     # and group the windows under the app.
     if sys.platform == "win32":

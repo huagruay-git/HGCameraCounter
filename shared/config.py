@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import yaml
 
+# Locked Supabase project URL — every device/branch uses this one project. The Setup
+# Wizard shows it read-only so a branch can't accidentally point at the wrong backend.
+LOCKED_SUPABASE_URL = "https://doafupjlqkydaoxmsqtc.supabase.co"
+
 
 def _app_base() -> Path:
     """Base dir for relative paths: project root (source) or the exe folder (frozen)."""
@@ -201,7 +205,7 @@ class Config:
                 "manifest_url": os.getenv("MODELS_MANIFEST_URL", ""),
             },
             "supabase": {
-                "url": os.getenv("SUPABASE_URL", ""),
+                "url": LOCKED_SUPABASE_URL,
                 "key": os.getenv("SUPABASE_ANON_KEY", ""),
             },
             "cameras": {},
