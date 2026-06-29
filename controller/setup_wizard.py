@@ -55,6 +55,28 @@ class WorkerSignals(QObject):
 # SETUP WIZARD
 # =========================
 
+class _WizardScanAdapter:
+    """Minimal 'manager' so the shared LANCameraScannerDialog can add discovered cameras
+    into the Setup Wizard's config and refresh its table (the wizard has no
+    CameraManagerWidget of its own)."""
+    def __init__(self, wizard):
+        self._w = wizard
+        self.config = wizard.config
+        self.controller = self  # the dialog calls self.manager.controller.save_config()
+
+    def save_config(self):
+        try:
+            self._w.config.save()
+        except Exception:
+            pass
+
+    def refresh_camera_list(self):
+        self._w.refresh_camera_list()
+
+    def _refresh_live_view_cameras(self):
+        pass  # the wizard has no live view
+
+
 class SetupWizard(QMainWindow):
     """Setup Wizard - Multi-step configuration"""
     
@@ -152,7 +174,18 @@ class SetupWizard(QMainWindow):
         
         # Refresh camera list
         self.refresh_camera_list()
-        
+
+        # Auto-discover (scan the network for cameras/NVRs of any brand)
+        discover_btn = QPushButton("🔍  ค้นหากล้องอัตโนมัติ")
+        discover_btn.setToolTip(
+            "สแกนหากล้อง/NVR ในเครือข่ายอัตโนมัติ (รองรับหลายยี่ห้อ Imou/Hikvision/FNK/ONVIF) "
+            "แล้วเลือกเพิ่มได้เลย — ไม่ต้องพิมพ์ URL RTSP เอง")
+        discover_btn.setStyleSheet(
+            "QPushButton{background:#F4C20D;color:#1A1A1A;font-weight:bold;padding:8px 16px;border-radius:6px;}"
+            "QPushButton:hover{background:#E0B000;}")
+        discover_btn.clicked.connect(self.discover_cameras)
+        layout.addWidget(discover_btn)
+
         # Add button
         add_btn = QPushButton("Add Camera")
         add_btn.clicked.connect(self.add_camera_dialog)
@@ -384,6 +417,16 @@ class SetupWizard(QMainWindow):
             action_btn.clicked.connect(lambda checked, cn=cam_name: self.edit_camera(cn))
             self.camera_table.setCellWidget(idx, 3, action_btn)
     
+    def discover_cameras(self):
+        """Open the multi-brand LAN scanner; add found cameras into the wizard's config."""
+        try:
+            from controller.camera_manager import LANCameraScannerDialog
+            dlg = LANCameraScannerDialog(self, _WizardScanAdapter(self))
+            dlg.exec()
+            self.refresh_camera_list()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open camera scanner: {e}")
+
     def add_camera_dialog(self):
         """Add new camera dialog"""
         dialog = QDialog(self)
