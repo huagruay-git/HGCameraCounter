@@ -648,8 +648,15 @@ class ZoneEditorWidget(QWidget):
         self._sync_canvas_edits_to_zones()
         zones = self.zones.get(self.current_camera, [])
         if not zones:
-            self._set_status("No zones to save", is_error=True)
-            return
+            # Allow saving an empty set so "delete all zones" actually persists (this used
+            # to just refuse, leaving the old zones in the file). Confirm to avoid a slip.
+            reply = QMessageBox.question(
+                self, "บันทึกเป็นว่าง",
+                f"ไม่มีโซนสำหรับกล้อง {self.current_camera}\n"
+                "บันทึกเป็น 'ไม่มีโซน' (ลบโซนทั้งหมดออกจากไฟล์)?")
+            if reply != QMessageBox.StandardButton.Yes:
+                self._set_status("ยกเลิกการบันทึก")
+                return
         zones_to_save = []
         for z in zones:
             pts = self._normalized_points(z.get("points", []))
