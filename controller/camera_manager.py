@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem,
     QAbstractItemView
 )
-from PySide6.QtCore import Qt, Signal, QThread
+from PySide6.QtCore import Qt, Signal, QThread, QTimer
 from PySide6.QtGui import QPixmap, QImage, QFont
 
 
@@ -918,7 +918,26 @@ class CameraManagerWidget:
     def open_lan_scanner_dialog(self):
         dialog = LANCameraScannerDialog(self.controller, self)
         dialog.exec()
-    
+        self._offer_restart_service()
+
+    def _offer_restart_service(self):
+        """The runtime reads the camera list only when it starts, so after a camera change
+        offer to restart the running service — otherwise the new/edited camera is ignored
+        until the next Start Service (a common 'my camera isn't used' surprise)."""
+        try:
+            if not getattr(self.controller, "is_running", False):
+                return
+            reply = QMessageBox.question(
+                self.controller, "รีสตาร์ทระบบนับ",
+                "กล้องมีการเปลี่ยนแปลง — ระบบที่กำลังทำงานยังใช้กล้องชุดเดิมจนกว่าจะรีสตาร์ท\n\n"
+                "รีสตาร์ทระบบนับตอนนี้เพื่อเริ่มใช้กล้องที่อัปเดตไหม?",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.controller.stop_service()
+                QTimer.singleShot(1500, self.controller.start_service)
+        except Exception:
+            pass
+
     def add_camera_dialog(self):
         """เน€เธเธดเธ” dialog เน€เธเธดเนเธกเธเธฅเนเธญเธ"""
         dialog = CameraFormDialog(self.controller)
@@ -951,6 +970,7 @@ class CameraManagerWidget:
             self.refresh_camera_list()
             self._refresh_live_view_cameras()
             QMessageBox.information(self.controller, "Success", f"Camera '{cam_name}' added")
+            self._offer_restart_service()
     
     def edit_camera_dialog(self):
         """เน€เธเธดเธ” dialog เนเธเนเนเธเธเธฅเนเธญเธ"""
@@ -986,6 +1006,7 @@ class CameraManagerWidget:
             self.refresh_camera_list()
             self._refresh_live_view_cameras()
             QMessageBox.information(self.controller, "Success", f"Camera '{cam_name}' updated")
+            self._offer_restart_service()
     
     def delete_camera(self):
         """เธฅเธเธเธฅเนเธญเธ"""
@@ -1011,6 +1032,7 @@ class CameraManagerWidget:
             self.refresh_camera_list()
             self._refresh_live_view_cameras()
             QMessageBox.information(self.controller, "Success", f"Camera '{cam_name}' deleted")
+            self._offer_restart_service()
     
     def test_camera(self):
         """เธ—เธ”เธชเธญเธเธเธฅเนเธญเธเธ—เธตเนเน€เธฅเธทเธญเธ"""
