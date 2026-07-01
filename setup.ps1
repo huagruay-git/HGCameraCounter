@@ -184,6 +184,16 @@ if ($NoAutostart) {
     Step "Installing boot auto-start shortcut"
     try { & (Join-Path $root "scripts\install_autostart.ps1") }
     catch { Warn "Auto-start install failed: $($_.Exception.Message)" }
+
+    # If Parsec is installed, add it to Startup too so remote access survives a reboot.
+    $parsec = @("C:\Program Files\Parsec\parsecd.exe",
+                (Join-Path $env:LOCALAPPDATA 'Parsec\parsecd.exe')) |
+              Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if ($parsec) {
+        Step "Parsec detected - adding it to Startup (remote access after reboot)"
+        try { & (Join-Path $root "scripts\install_parsec_autostart.ps1") }
+        catch { Warn "Parsec auto-start install failed: $($_.Exception.Message)" }
+    }
 }
 
 # 7) Optional liveness watchdog scheduled task.
