@@ -194,7 +194,7 @@ class Config:
         """Get default configuration"""
         defaults = {
             "project_name": "HG Camera Counter",
-            "version": "0.3.1",
+            "version": "0.3.2",
             "branch_code": os.getenv("BRANCH_CODE", "DEMO"),
             # When true, the dashboard auto-starts counting shortly after it opens
             # (unattended boot recovery). The Startup launcher also passes --autostart

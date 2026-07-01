@@ -300,7 +300,7 @@ class MainController(QMainWindow):
         # Initialize camera manager
         self.camera_manager = CameraManagerWidget(self)
         
-        self.setWindowTitle("HG Camera Counter - Controller")
+        self.setWindowTitle(f"HG Camera Counter v{self._current_version()} - Controller")
         _icon = _app_icon_path()
         if _icon:
             self.setWindowIcon(QIcon(_icon))
@@ -342,7 +342,10 @@ class MainController(QMainWindow):
         # Header
         header_layout = QHBoxLayout()
         
-        title = QLabel(f"HG Camera Counter - {self.config.get('branch_code', 'DEMO')}")
+        _bc = str(self.config.get('branch_code', 'DEMO') or 'DEMO')
+        if _bc.startswith('${'):
+            _bc = 'DEMO'  # unexpanded template placeholder -> show the default
+        title = QLabel(f"HG Camera Counter  v{self._current_version()}   ·   สาขา {_bc}")
         title_font = QFont()
         title_font.setPointSize(16)
         title_font.setBold(True)

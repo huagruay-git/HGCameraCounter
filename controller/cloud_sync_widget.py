@@ -577,8 +577,21 @@ class CloudSyncWidget(QWidget):
             "camera_total": int(total_count),
             "count_mode": str(status.get("count_mode", "")),
             "branch_code": str(self._config_dict().get("branch_code", "")),
+            "app_version": self._app_version(),
         }
         return heartbeat_status, metrics, message
+
+    def _app_version(self) -> str:
+        """Installed app version (VERSION file) — reported to HQ in each heartbeat."""
+        try:
+            import sys
+            from pathlib import Path
+            from shared.updater import read_version_file
+            root = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+                    else Path(__file__).resolve().parent.parent)
+            return read_version_file(root) or str(self._config_dict().get("version", "") or "")
+        except Exception:
+            return str(self._config_dict().get("version", "") or "")
 
     def _build_realtime_payload(self, state: Dict[str, Any]) -> Dict[str, Any]:
         status = state.get("status", {}) or {}

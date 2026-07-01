@@ -40,7 +40,7 @@ from shared.logger import setup_logger
 # (.venv, data/, models/, logs/, reports/, snapshots/, config) is preserved.
 CODE_UPDATE_PATHS = [
     "controller", "runtime", "shared", "services", "detectors",
-    "tracking", "app", "ui", "scripts", "requirements.txt", "VERSION",
+    "tracking", "app", "ui", "scripts", "assets", "requirements.txt", "VERSION",
 ]
 
 
