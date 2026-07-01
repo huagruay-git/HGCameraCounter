@@ -1067,9 +1067,41 @@ class MainController(QMainWindow):
         run_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 10px;")
         run_btn.clicked.connect(self.run_diagnostics)
         layout.addWidget(run_btn)
-        
+
+        # System Doctor: check + auto-install everything the app needs (VC++, Git, Python
+        # deps, ffmpeg, model, shortcuts) — for fixing already-installed machines.
+        doctor_btn = QPushButton("🩺  ตรวจสอบ & ซ่อมระบบ (ติดตั้งสิ่งที่ขาดอัตโนมัติ)")
+        doctor_btn.setStyleSheet(
+            "QPushButton{background:#2E7D32;color:white;font-weight:bold;padding:10px;border-radius:6px;}"
+            "QPushButton:hover{background:#1B5E20;}")
+        doctor_btn.setToolTip("เช็คทุกสิ่งที่โปรแกรมต้องใช้ แล้วติดตั้งตัวที่ขาดให้อัตโนมัติ")
+        doctor_btn.clicked.connect(self.run_system_doctor)
+        layout.addWidget(doctor_btn)
+
         widget.setLayout(layout)
         self.tabs.addTab(widget, "Diagnostics")
+
+    def run_system_doctor(self):
+        """Launch the System Doctor (scripts/doctor.ps1 -Fix) in an elevated, visible
+        PowerShell so winget installs work with a single UAC prompt and the operator sees
+        progress. Fixes missing VC++ / Git / Python deps / ffmpeg / model / shortcuts."""
+        try:
+            script = self._project_root() / "scripts" / "doctor.ps1"
+            if not script.exists():
+                QMessageBox.warning(self, "System Doctor", f"ไม่พบสคริปต์:\n{script}")
+                return
+            inner = ("Start-Process powershell -Verb RunAs -ArgumentList "
+                     "'-NoExit','-ExecutionPolicy','Bypass','-File',"
+                     f"'{script}','-Fix'")
+            subprocess.Popen(["powershell", "-NoProfile", "-Command", inner],
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            QMessageBox.information(
+                self, "ตรวจสอบ & ซ่อมระบบ",
+                "กำลังเปิดตัวตรวจสอบระบบในหน้าต่างใหม่ (อาจมี UAC เด้ง กด Yes)\n\n"
+                "มันจะเช็ค + ติดตั้งสิ่งที่ขาดให้อัตโนมัติ (VC++, Git, ไลบรารี, ffmpeg, โมเดล, ทางลัด)\n"
+                "รอจนขึ้น 'All good' หรือ 'fixed' → ปิด-เปิดโปรแกรมใหม่")
+        except Exception as e:
+            QMessageBox.critical(self, "System Doctor", f"เปิดตัวตรวจสอบไม่สำเร็จ:\n{e}")
     
     def tab_logs(self):
         """Logs tab"""

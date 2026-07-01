@@ -4,7 +4,7 @@
 # Or set environment variables: SUPABASE_URL, SUPABASE_ANON_KEY, BRANCH_CODE
 
 project_name: "HG Camera Counter"
-version: "0.3.5"
+version: "0.3.6"
 branch_code: "${BRANCH_CODE:DEMO}"  # Or set BRANCH_CODE env var
 
 # Unattended boot recovery: start counting automatically when the dashboard opens.
