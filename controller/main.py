@@ -131,6 +131,41 @@ def _restore_device_identity() -> None:
         logger.exception("Device identity restore failed")
 
 
+def _ensure_parsec_autostart() -> None:
+    """Silently add Parsec to the Startup folder if it's installed but not there yet, so a
+    branch PC brings Parsec back up after a reboot (remote access). Runs on every launch;
+    no-op once the shortcut exists. Windows-only, best-effort. This is what makes the
+    Parsec-autostart feature apply to already-deployed devices via a normal OTA update."""
+    if sys.platform != "win32":
+        return
+    try:
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return
+        link = Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "Parsec.lnk"
+        if link.exists():
+            return  # already set up
+        parsec_locs = [
+            Path(r"C:\Program Files\Parsec\parsecd.exe"),
+            Path(os.environ.get("LOCALAPPDATA", "") or "") / "Parsec" / "parsecd.exe",
+        ]
+        if not any(p.exists() for p in parsec_locs):
+            return  # Parsec not installed here
+        root = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+                else Path(__file__).resolve().parent.parent)
+        script = root / "scripts" / "install_parsec_autostart.ps1"
+        if not script.exists():
+            return
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        logger.info("Ensured Parsec autostart (Parsec installed, shortcut was missing)")
+    except Exception:
+        logger.exception("Parsec autostart ensure failed")
+
+
 class CommandWorker(QObject):
     """Run subprocess command without blocking the UI thread."""
     output = Signal(str)
@@ -3400,6 +3435,8 @@ def main():
         os.environ["HGCC_AUTOSTART"] = "1"
     # Reconnect as the same device after a reinstall (restore saved token/code if unpaired).
     _restore_device_identity()
+    # Silently ensure Parsec auto-starts (if installed) so remote access survives reboots.
+    _ensure_parsec_autostart()
     # Windows: a distinct AppUserModelID makes the taskbar show our icon (not pythonw's)
     # and group the windows under the app.
     if sys.platform == "win32":
