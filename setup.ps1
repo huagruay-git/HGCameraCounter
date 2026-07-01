@@ -98,6 +98,15 @@ if (-not $SkipPrereqs) {
     } else {
         Warn "Python 3.11 missing - https://www.python.org/downloads/release/python-3119/"
     }
+
+    # torch / opencv need the Microsoft Visual C++ runtime, or they fail with a DLL load
+    # error on a clean Windows install. winget is idempotent (skips if already present).
+    if ($hasWinget) {
+        Winget-Install "Microsoft.VCRedist.2015+.x64" "Visual C++ Redistributable"
+        Ok "Visual C++ Redistributable ensured"
+    } else {
+        Warn "Install Visual C++ Redistributable: https://aka.ms/vs/16/release/vc_redist.x64.exe"
+    }
 }
 
 # 1) Decide how to invoke the base Python 3.11 (avoid capturing its path: a Thai user
