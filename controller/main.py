@@ -86,6 +86,13 @@ _DEFAULT_MODELS_MANIFEST_URL = (
     "app-updates/models/models_manifest.json"
 )
 
+# Default OTA update metadata (same public bucket). Used when `updates.metadata_url` is
+# blank so every device checks for updates out of the box — no URL to type.
+_DEFAULT_UPDATE_METADATA_URL = (
+    "https://doafupjlqkydaoxmsqtc.supabase.co/storage/v1/object/public/"
+    "app-updates/update_metadata.json"
+)
+
 
 def _restore_device_identity() -> None:
     """Reconnect as the SAME device after a reinstall: if this install has no device token
@@ -1283,6 +1290,12 @@ class MainController(QMainWindow):
         return (str(self._models_cfg().get('manifest_url', '') or '').strip()
                 or _DEFAULT_MODELS_MANIFEST_URL)
 
+    def _update_metadata_url(self) -> str:
+        """The OTA update metadata URL: config override, else the shared public default so
+        Check/auto-update work without anyone typing a URL."""
+        return (str(self._updates_cfg().get('metadata_url', '') or '').strip()
+                or _DEFAULT_UPDATE_METADATA_URL)
+
     def _local_model_path(self) -> Path:
         root = self._project_root()
         models_dir = self.config.get('paths', {}).get('models', 'models')
@@ -2213,17 +2226,17 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         dlg.setMinimumWidth(640)
         form = QFormLayout(dlg)
 
-        url_edit = QLineEdit(str(cfg.get('metadata_url', '') or ''))
-        url_edit.setPlaceholderText(
-            "https://<proj>.supabase.co/storage/v1/object/public/app-updates/update_metadata.json")
+        # Pre-filled with the company default so nobody has to type it (still editable).
+        url_edit = QLineEdit(self._update_metadata_url())
+        url_edit.setToolTip("ตั้งค่ามาให้แล้ว (โปรเจกต์ของบริษัท) — แก้ได้ถ้าจำเป็น")
         form.addRow("Update URL (metadata JSON):", url_edit)
 
         startup_chk = QCheckBox("Check for updates automatically on startup")
-        startup_chk.setChecked(bool(cfg.get('auto_check_on_startup', False)))
+        startup_chk.setChecked(bool(cfg.get('auto_check_on_startup', True)))
         form.addRow(startup_chk)
 
         auto_chk = QCheckBox("Install updates automatically — no prompt, app restarts")
-        auto_chk.setChecked(bool(cfg.get('auto_install', False)))
+        auto_chk.setChecked(bool(cfg.get('auto_install', True)))
         form.addRow(auto_chk)
 
         info = QLabel(f"Current version: {self._current_version()}")
@@ -2250,12 +2263,11 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
             QMessageBox.critical(self, "Update Settings", f"Could not save settings: {e}")
 
     def _auto_check_on_startup(self):
-        cfg = self._updates_cfg()
-        if not cfg.get('auto_check_on_startup'):
+        # Always check on startup — the URL defaults to the company bucket, so every device
+        # self-updates without any config. auto_install decides silent-install vs notify.
+        if not self._update_metadata_url():
             return
-        if not str(cfg.get('metadata_url', '') or '').strip():
-            return
-        self._start_update_worker(do_download=bool(cfg.get('auto_install', False)))
+        self._start_update_worker(do_download=bool(self._updates_cfg().get('auto_install', True)))
 
     def _setup_periodic_update_check(self):
         """Start a repeating timer that re-checks for updates every N hours.
@@ -2272,7 +2284,7 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         if hours <= 0:
             logger.info("Periodic update check disabled (check_interval_hours<=0)")
             return
-        if not str(cfg.get('metadata_url', '') or '').strip():
+        if not self._update_metadata_url():
             return
         self._update_check_timer = QTimer(self)
         self._update_check_timer.timeout.connect(self._periodic_update_check)
@@ -2280,11 +2292,10 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         logger.info("Periodic update check scheduled every %.1fh", hours)
 
     def _periodic_update_check(self):
-        cfg = self._updates_cfg()
-        if not str(cfg.get('metadata_url', '') or '').strip():
+        if not self._update_metadata_url():
             return
         logger.info("Periodic update check firing")
-        self._start_update_worker(do_download=bool(cfg.get('auto_install', False)))
+        self._start_update_worker(do_download=bool(self._updates_cfg().get('auto_install', True)))
 
     def _auto_start_service_on_boot(self):
         """Start counting automatically on an unattended boot.
@@ -2309,7 +2320,7 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
     def _start_update_worker(self, do_download: bool):
         if getattr(self, '_update_worker', None) is not None and self._update_worker.isRunning():
             return
-        url = str(self._updates_cfg().get('metadata_url', '') or '').strip()
+        url = self._update_metadata_url()
         if not url:
             return
         self.statusBar().showMessage("Checking for updates...")
@@ -2370,13 +2381,8 @@ Updated: {datetime.now().strftime("%H:%M:%S")}"""
         or will prompt for a URL.
         """
         try:
-            upd_cfg = CONFIG.get('updates', {})
-            metadata_url = upd_cfg.get('metadata_url')
-            if not metadata_url:
-                from PySide6.QtWidgets import QInputDialog
-                metadata_url, ok = QInputDialog.getText(self, 'Update URL', 'Enter metadata JSON URL:')
-                if not ok or not metadata_url:
-                    return
+            # Uses the company default when config leaves it blank — never prompts.
+            metadata_url = self._update_metadata_url()
 
             updater = Updater(CONFIG.data if hasattr(CONFIG, 'data') else CONFIG)
             self.statusBar().showMessage('Checking for updates...')

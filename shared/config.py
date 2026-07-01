@@ -13,6 +13,15 @@ import yaml
 # Wizard shows it read-only so a branch can't accidentally point at the wrong backend.
 LOCKED_SUPABASE_URL = "https://doafupjlqkydaoxmsqtc.supabase.co"
 
+# Default OTA endpoints (public app-updates bucket). Used when config leaves them blank so
+# every device checks for updates / lists models out of the box — no URL to type in.
+DEFAULT_UPDATE_METADATA_URL = (
+    LOCKED_SUPABASE_URL + "/storage/v1/object/public/app-updates/update_metadata.json"
+)
+DEFAULT_MODELS_MANIFEST_URL = (
+    LOCKED_SUPABASE_URL + "/storage/v1/object/public/app-updates/models/models_manifest.json"
+)
+
 
 def _app_base() -> Path:
     """Base dir for relative paths: project root (source) or the exe folder (frozen)."""
@@ -194,7 +203,7 @@ class Config:
         """Get default configuration"""
         defaults = {
             "project_name": "HG Camera Counter",
-            "version": "0.3.2",
+            "version": "0.3.3",
             "branch_code": os.getenv("BRANCH_CODE", "DEMO"),
             # When true, the dashboard auto-starts counting shortly after it opens
             # (unattended boot recovery). The Startup launcher also passes --autostart

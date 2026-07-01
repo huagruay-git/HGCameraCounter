@@ -4,7 +4,7 @@
 # Or set environment variables: SUPABASE_URL, SUPABASE_ANON_KEY, BRANCH_CODE
 
 project_name: "HG Camera Counter"
-version: "0.3.2"
+version: "0.3.3"
 branch_code: "${BRANCH_CODE:DEMO}"  # Or set BRANCH_CODE env var
 
 # Unattended boot recovery: start counting automatically when the dashboard opens.
@@ -23,10 +23,10 @@ supabase:
 # CODE-ONLY update (venv/data/models/config are preserved and the replaced code is
 # backed up under download_dir/backup), then restarts the controller.
 updates:
-  metadata_url: ""         # HTTPS URL to release metadata JSON (see shared/updater.py docstring)
+  metadata_url: ""         # blank = use the built-in company default URL (see shared/config.py)
   download_dir: "updates"  # where staged downloads + backups are kept
-  auto_install: false      # true = install a newer update automatically + restart (no prompt)
-  auto_check_on_startup: false  # true = silently check for updates ~4s after launch
+  auto_install: true       # install a newer update automatically + restart (no prompt)
+  auto_check_on_startup: true   # check for updates ~4s after launch (checks always run anyway)
   check_interval_hours: 24      # re-check every N hours while running (0 = only at startup)
 
 # AI model updates: the "อัปเดตโมเดล" tab lists model versions from a PUBLIC manifest
